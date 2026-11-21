@@ -33,11 +33,17 @@ make format                    # apply ruff formatting and fixes
 Integration tests need Docker:
 
 ```sh
-make up                        # Kafka 4.3.2 on 127.0.0.1:9092, waits until healthy
+make up                        # Kafka 4.3.2 on 127.0.0.1:9092 and PostgreSQL 19 on 127.0.0.1:5432
 make topics                    # declare orders.placed.v1 (6 partitions); safe to rerun
-make test-integration          # tests against that broker, on their own test.* topics
-make down                      # stop; the data volume is kept
+make test-integration          # against those services: own test.* topics, event_pipeline_test DB
+make down                      # stop; the data volumes are kept
 ```
+
+PostgreSQL has two databases: `event_pipeline` and `event_pipeline_test`, which integration tests
+use exclusively (they refuse any database whose name does not end in `_test`). The test database
+is created only when the data volume is new (`docker/postgres-init/`). The password in
+`compose.yaml` is a fixed local-development value; settings and their defaults are listed in
+`.env.example`.
 
 Integration tests create their own `test.<id>` topics and do not delete them; they stay in the
 Kafka data volume until it is removed.

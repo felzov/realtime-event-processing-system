@@ -87,6 +87,15 @@ and a paused broker gave `_MSG_TIMED_OUT` after 5.6 s. Setting up Compose also s
 `compose.yaml` spells out the whole single-node configuration and turns off
 `auto.create.topics.enable`.
 
+**Update 2026-11-21 (phase 3, slice 1):** decision 6's driver is **psycopg 3** (`psycopg[binary]`
+3.3.9, used synchronously), with **SQLAlchemy 2.1.9**, the current release, which keeps the 2.0-style
+API that decision 6 means. psycopg 3 is the maintained PostgreSQL driver (psycopg2 receives
+maintenance fixes only) and has wheels for every Python version CI runs, 3.12 and 3.14. Every
+database URL names the driver (`postgresql+psycopg://`, checked when settings load), because
+SQLAlchemy's default for a bare `postgresql://` changed between versions. PostgreSQL itself is
+19.0 (`postgres:19.0`, pinned by digest in `compose.yaml`), the current major release; nothing
+depends on a feature new in 19.
+
 ## Consequences
 
 - The consumer loop reads top to bottom with no event loop, so the order "database commit, then

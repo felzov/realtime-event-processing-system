@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 import pytest
@@ -67,6 +68,9 @@ def test_backstop_with_2s_margin_is_accepted() -> None:
         {"kafka_bootstrap_servers": ""},
         {"ready_timeout_s": 0},
         {"publisher_close_timeout_s": 0},
+        {"db_connect_timeout_s": 1},
+        {"db_statement_timeout_ms": 0},
+        {"db_pool_timeout_s": 0},
     ],
     ids=[
         "topic_with_space",
@@ -79,6 +83,9 @@ def test_backstop_with_2s_margin_is_accepted() -> None:
         "empty_bootstrap",
         "zero_ready_timeout",
         "zero_close_timeout",
+        "connect_timeout_below_libpq_minimum",
+        "zero_statement_timeout",
+        "zero_pool_timeout",
     ],
 )
 def test_invalid_settings_are_rejected(overrides: dict[str, Any]) -> None:
@@ -93,3 +100,51 @@ def test_validation_errors_do_not_echo_values(monkeypatch: pytest.MonkeyPatch) -
         make_settings()
 
     assert "SECRET" not in str(exc_info.value)
+
+
+# A distinctive password: no error message or repr may contain it.
+DB_PASSWORD = "pw-MARKER-91c4"  # gitleaks:allow
+
+
+def test_database_url_default_is_the_local_compose_database() -> None:
+    url = make_settings().database_url.get_secret_value()
+
+    assert url.startswith("postgresql+psycopg://")
+    assert url.endswith("@127.0.0.1:5432/event_pipeline")
+
+
+def test_database_url_is_hidden_in_the_settings_repr() -> None:
+    settings = make_settings(
+        database_url=f"postgresql+psycopg://app:{DB_PASSWORD}@db.example:5432/events"
+    )
+
+    assert DB_PASSWORD not in repr(settings)
+    assert DB_PASSWORD not in str(settings)
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        # The driver must be named, not left to SQLAlchemy's default.
+        (f"postgresql://app:{DB_PASSWORD}@db:5432/events", "must start with postgresql+psycopg"),
+        (f"mysql+pymysql://app:{DB_PASSWORD}@db:3306/events", "must start with postgresql+psycopg"),
+        (f"postgresql+psycopg://app:{DB_PASSWORD}@db:5432", "must name a database"),
+        (f"not a url {DB_PASSWORD}", "not a valid database URL"),
+        # SQLAlchemy's own error for these quotes the text it read as a port: the password.
+        (f"postgresql+psycopg://app:{DB_PASSWORD}", "not a valid database URL"),
+        (f"postgresql+psycopg://app:p@ss:{DB_PASSWORD}@db:5432/events", "not a valid database URL"),
+    ],
+    ids=[
+        "no_driver",
+        "other_dialect",
+        "no_database",
+        "unparseable",
+        "no_host",
+        "unencoded_at_in_password",
+    ],
+)
+def test_invalid_database_url_is_rejected_without_echoing_it(url: str, message: str) -> None:
+    with pytest.raises(ValidationError, match=re.escape(message)) as exc_info:
+        make_settings(database_url=url)
+
+    assert DB_PASSWORD not in str(exc_info.value)

@@ -6,6 +6,10 @@
 # without it fails instead of skipping.
 TEST_KAFKA_BOOTSTRAP_SERVERS ?= 127.0.0.1:9092
 export TEST_KAFKA_BOOTSTRAP_SERVERS
+# The test database from `make up` (created by docker/postgres-init). Test code refuses a database
+# whose name does not end in `_test`. The password is compose.yaml's local development value.
+TEST_DATABASE_URL ?= postgresql+psycopg://event_pipeline:event_pipeline_local@127.0.0.1:5432/event_pipeline_test
+export TEST_DATABASE_URL
 
 install:
 > uv sync
@@ -25,7 +29,7 @@ typecheck:
 test:
 > uv run --locked pytest -m "not integration"
 
-# Needs `make up`. Tests create their own uniquely named topics.
+# Needs `make up`. Tests create their own uniquely named topics and use only the `_test` database.
 test-integration:
 > uv run --locked pytest -m integration
 
@@ -34,7 +38,7 @@ check: lint typecheck test
 
 check-all: check test-integration
 
-# Starts Kafka and waits until it is healthy.
+# Starts Kafka and PostgreSQL and waits until both are healthy.
 up:
 > docker compose up -d --wait
 

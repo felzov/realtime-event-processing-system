@@ -100,7 +100,7 @@ business rules.
 | Kafka in Docker Compose (`make up`, `make topics`) | Local broker; topic declared explicitly, auto-create off | 2 | Built |
 | `broker/` producer, ingest API (`POST /events`) | Validate, produce with `acks=all`, answer after the broker acknowledged | 2 | Built |
 | `/health`, `/ready` | Liveness; readiness of the broker, the topic and the producer's poll thread | 2 | Built (database and migration checks in phase 3) |
-| PostgreSQL in Docker Compose | Local database | 3 | Not built |
+| PostgreSQL in Docker Compose (`make up`) | Local database and the `_test` database for integration tests | 3 | Built |
 | `data/` models and migrations | `aggregates` and `processed_events` tables | 3 | Not built |
 | `services/` apply | Deduplicate and upsert the aggregate in one transaction | 3 | Not built |
 | `consumer/` | Poll loop, manual offset commit, shutdown | 3 | Not built |

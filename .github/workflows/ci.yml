@@ -47,20 +47,21 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      # The same compose.yaml as locally, not a service container: one Kafka configuration to
-      # keep correct instead of two.
-      - name: Start Kafka
+      # The same compose.yaml as locally, not service containers: one configuration of Kafka and
+      # PostgreSQL to keep correct instead of two. The Makefile sets TEST_DATABASE_URL to its
+      # test database.
+      - name: Start Kafka and PostgreSQL
         run: make up
 
       - name: Declare orders.placed.v1
         run: make topics
 
-      - name: Integration tests (Kafka)
+      - name: Integration tests (Kafka, PostgreSQL)
         run: make test-integration
 
-      - name: Kafka logs on failure
+      - name: Service logs on failure
         if: failure()
-        run: docker compose logs kafka --tail 200
+        run: docker compose logs --tail 200
 
   secrets:
     # The gitleaks pre-commit hook only scans staged changes and only where hooks are installed,
