@@ -35,3 +35,10 @@ def test_engine_repr_masks_the_password() -> None:
     assert DB_PASSWORD not in repr(engine)
     assert DB_PASSWORD not in str(engine.url)
     engine.dispose()
+
+
+def test_engine_hides_statement_parameters_in_errors() -> None:
+    # Parameters are event values (store_id, amounts); errors must not quote them.
+    engine = make_engine(make_settings())
+
+    assert engine.hide_parameters is True

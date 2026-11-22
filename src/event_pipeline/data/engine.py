@@ -28,4 +28,7 @@ def make_engine(settings: Settings) -> Engine:
         # A pooled connection the server closed (restart, idle timeout) is replaced before use
         # instead of failing the caller's first statement.
         pool_pre_ping=True,
+        # Statement parameters are event values; without this SQLAlchemy quotes them in every
+        # error message, and from there in logs.
+        hide_parameters=True,
     )
