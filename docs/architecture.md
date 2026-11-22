@@ -102,8 +102,8 @@ business rules.
 | `/health`, `/ready` | Liveness; readiness of the broker, the topic and the producer's poll thread | 2 | Built (database and migration checks in phase 3) |
 | PostgreSQL in Docker Compose (`make up`) | Local database and the `_test` database for integration tests | 3 | Built |
 | `data/` tables and migrations | `order_aggregates` and `processed_events`; Alembic revision 0001 with CHECKs from the contract (`make db-migrate`) | 3 | Built |
-| `services/` apply (`apply_order_placed`) | Deduplicate by `event_id` and upsert the aggregate in one transaction; a duplicate changes nothing, any database error rolls back both | 3 | Built (not yet called by a consumer) |
-| `consumer/` | Poll loop, manual offset commit, shutdown | 3 | Not built |
+| `services/` apply (`apply_order_placed`) | Deduplicate by `event_id` and upsert the aggregate in one transaction; a duplicate changes nothing, any database error rolls back both | 3 | Built |
+| `consumer/` (`make consumer`) | Poll loop; offset committed synchronously after the apply transaction; invalid message logged and skipped; any failure stops the process without committing; SIGTERM finishes the current event | 3 | Built |
 | Query API | Read aggregates from PostgreSQL | 3 | Not built |
 | Late-event policy | Watermark and allowed lateness | 4 | Not built |
 | Restart and rebalance handling | Offset behaviour on restart, commit on partition revoke | 5 | Not built |

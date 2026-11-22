@@ -1,7 +1,7 @@
 .RECIPEPREFIX = >
 
 .PHONY: install lint format typecheck test test-integration check check-all up down topics run \
-	db-migrate db-revision
+	db-migrate db-revision consumer
 
 # The broker from `make up`. Override for another broker; a direct `pytest -m integration` run
 # without it fails instead of skipping.
@@ -55,6 +55,12 @@ topics:
 # (`make up`) and the topic exists (`make topics`).
 run:
 > uv run --locked uvicorn event_pipeline.main:create_app_from_settings --factory --host 127.0.0.1 --port 8000
+
+# The aggregating consumer: reads orders.placed.v1 and applies each event to PostgreSQL. Needs
+# `make up`, `make topics` and `make db-migrate`. Ctrl+C (or SIGTERM) stops it after the current
+# event.
+consumer:
+> uv run --locked python -m event_pipeline.consumer
 
 # Migrates the database in DATABASE_URL (default: the local development database) to the latest
 # revision.
