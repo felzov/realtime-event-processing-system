@@ -5,6 +5,7 @@ description = "Real-time event pipeline with explicit failure behaviour: version
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.20.1",
     "confluent-kafka>=2.16.2",
     "fastapi>=0.165.0",
     "psycopg[binary]>=3.3.9",
@@ -32,7 +33,7 @@ packages = ["src/event_pipeline"]
 
 # Allowlist: hatchling ignores .git/info/exclude, so anything not listed here stays out of the sdist.
 [tool.hatch.build.targets.sdist]
-only-include = ["src", "tests", "README.md", "pyproject.toml"]
+only-include = ["src", "migrations", "tests", "alembic.ini", "README.md", "pyproject.toml"]
 
 [tool.ruff]
 line-length = 100
@@ -45,7 +46,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "N", "RUF"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "migrations"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

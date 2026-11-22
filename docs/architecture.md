@@ -101,7 +101,7 @@ business rules.
 | `broker/` producer, ingest API (`POST /events`) | Validate, produce with `acks=all`, answer after the broker acknowledged | 2 | Built |
 | `/health`, `/ready` | Liveness; readiness of the broker, the topic and the producer's poll thread | 2 | Built (database and migration checks in phase 3) |
 | PostgreSQL in Docker Compose (`make up`) | Local database and the `_test` database for integration tests | 3 | Built |
-| `data/` models and migrations | `aggregates` and `processed_events` tables | 3 | Not built |
+| `data/` tables and migrations | `order_aggregates` and `processed_events`; Alembic revision 0001 with CHECKs from the contract (`make db-migrate`) | 3 | Built |
 | `services/` apply | Deduplicate and upsert the aggregate in one transaction | 3 | Not built |
 | `consumer/` | Poll loop, manual offset commit, shutdown | 3 | Not built |
 | Query API | Read aggregates from PostgreSQL | 3 | Not built |

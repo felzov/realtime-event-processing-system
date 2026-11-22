@@ -35,6 +35,7 @@ Integration tests need Docker:
 ```sh
 make up                        # Kafka 4.3.2 on 127.0.0.1:9092 and PostgreSQL 19 on 127.0.0.1:5432
 make topics                    # declare orders.placed.v1 (6 partitions); safe to rerun
+make db-migrate                # migrate event_pipeline to the latest revision; safe to rerun
 make test-integration          # against those services: own test.* topics, event_pipeline_test DB
 make down                      # stop; the data volumes are kept
 ```
@@ -44,6 +45,12 @@ use exclusively (they refuse any database whose name does not end in `_test`). T
 is created only when the data volume is new (`docker/postgres-init/`). The password in
 `compose.yaml` is a fixed local-development value; settings and their defaults are listed in
 `.env.example`.
+
+The schema comes from hand-written Alembic migrations in `migrations/`, each with a working
+downgrade. `make db-migrate` applies them to the database in `DATABASE_URL`; the integration tests
+migrate the test database themselves, down to an empty schema and back up. A new migration starts
+from `make db-revision ID=0002 NAME="what it does"`, and `EXPECTED_REVISION` in
+`src/event_pipeline/data/tables.py` must name the new head (a unit test checks it).
 
 Integration tests create their own `test.<id>` topics and do not delete them; they stay in the
 Kafka data volume until it is removed.

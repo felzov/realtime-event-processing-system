@@ -56,6 +56,11 @@ jobs:
       - name: Declare orders.placed.v1
         run: make topics
 
+      # The tests migrate the test database themselves; this checks `make db-migrate` on a fresh
+      # development database, as a new clone would run it.
+      - name: Migrate the development database
+        run: make db-migrate
+
       - name: Integration tests (Kafka, PostgreSQL)
         run: make test-integration
 

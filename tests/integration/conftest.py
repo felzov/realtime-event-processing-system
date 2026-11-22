@@ -7,7 +7,7 @@ must end in `_test`.
 
 import os
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -15,16 +15,18 @@ import pytest
 from confluent_kafka import KafkaException
 from confluent_kafka.admin import AdminClient
 from pydantic import SecretStr
-from sqlalchemy import create_engine, text
+from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
 from event_pipeline.config import Settings
+from event_pipeline.data.engine import make_engine
 from tests.integration.db_helpers import (
     TEST_DATABASE_SUFFIX,
     NotATestDatabaseError,
     require_test_database,
 )
+from tests.migration_helpers import migrate
 
 _HERE = Path(__file__).parent
 
@@ -131,3 +133,22 @@ def db_settings_for(test_database_url: SecretStr) -> Callable[..., Settings]:
         )
 
     return make
+
+
+@pytest.fixture
+def db_engine(db_settings_for: Callable[..., Settings]) -> Iterator[Engine]:
+    """The application's engine (`make_engine`), on the test database."""
+    engine = make_engine(db_settings_for())
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def migrated_engine(db_engine: Engine) -> Engine:
+    """`db_engine` on a test database at the latest revision.
+
+    Upgraded for every test, not once per session: a migration test that fails half-way leaves
+    the database at another revision, and the next test must not inherit that.
+    """
+    migrate(db_engine, "up", "head")
+    return db_engine
