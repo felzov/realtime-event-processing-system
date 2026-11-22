@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pytest
-from confluent_kafka import Consumer, Message, Producer, TopicPartition
+from confluent_kafka import Consumer, KafkaError, KafkaException, Message, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient
 from pydantic import SecretStr
 from sqlalchemy import Connection, Engine, select, text
@@ -85,6 +85,37 @@ def produce(settings: Settings, *values: bytes, key: bytes = b"store") -> None:
     assert producer.flush(TIMEOUT_S) == 0
 
 
+# On a fresh broker the first group request creates the offsets topic and loads its coordinator;
+# until that is done, coordinator queries fail with one of these (seen in CI). They mean "not yet".
+COORDINATOR_NOT_READY = frozenset(
+    {
+        KafkaError.NOT_COORDINATOR,
+        KafkaError.COORDINATOR_LOAD_IN_PROGRESS,
+        KafkaError.COORDINATOR_NOT_AVAILABLE,
+    }
+)
+
+
+def ask_coordinator[T](query: Callable[[], T]) -> T:
+    """Run `query`, retrying while the group coordinator is not ready, for up to TIMEOUT_S.
+
+    Any other error, or the same one past the deadline, is raised.
+    """
+    deadline = time.monotonic() + TIMEOUT_S
+    while True:
+        try:
+            return query()
+        except KafkaException as exc:
+            error = exc.args[0] if exc.args else None
+            if (
+                not isinstance(error, KafkaError)
+                or error.code() not in COORDINATOR_NOT_READY
+                or time.monotonic() > deadline
+            ):
+                raise
+        time.sleep(0.2)
+
+
 def committed_offsets(settings: Settings) -> dict[int, int]:
     """The group's committed offset per partition; partitions with none are left out."""
     reader = Consumer(
@@ -98,7 +129,7 @@ def committed_offsets(settings: Settings) -> dict[int, int]:
         partitions = [TopicPartition(settings.events_topic, p) for p in range(PARTITIONS)]
         return {
             tp.partition: tp.offset
-            for tp in reader.committed(partitions, timeout=TIMEOUT_S)
+            for tp in ask_coordinator(lambda: reader.committed(partitions, timeout=TIMEOUT_S))
             if tp.offset >= 0
         }
     finally:
@@ -449,8 +480,12 @@ def processes(tmp_path: Path) -> Iterator[list[ConsumerProcess]]:
 
 def group_members(settings: Settings) -> int:
     admin = AdminClient({"bootstrap.servers": settings.kafka_bootstrap_servers})
-    futures = admin.describe_consumer_groups([settings.consumer_group_id])
-    return len(futures[settings.consumer_group_id].result(timeout=TIMEOUT_S).members)
+
+    def describe() -> int:
+        futures = admin.describe_consumer_groups([settings.consumer_group_id])
+        return len(futures[settings.consumer_group_id].result(timeout=TIMEOUT_S).members)
+
+    return ask_coordinator(describe)
 
 
 def blocked_by(engine: Engine, pid: int) -> bool:
