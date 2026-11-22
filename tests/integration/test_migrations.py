@@ -141,7 +141,9 @@ def insert_aggregate(connection: Connection, **overrides: Any) -> None:
 def test_a_valid_aggregate_row_is_stored_with_defaults(connection: Connection) -> None:
     insert_aggregate(connection, store_id="a" * 64, revenue_minor=0)
 
-    row = connection.execute(order_aggregates.select()).one()
+    # Filtered: other tests (test_aggregation.py) commit rows of their own stores.
+    query = order_aggregates.select().where(order_aggregates.c.store_id == "a" * 64)
+    row = connection.execute(query).one()
     assert row.store_id == "a" * 64
     assert row.revenue_minor == 0
     assert row.updated_at is not None
