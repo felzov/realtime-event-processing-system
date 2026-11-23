@@ -19,8 +19,7 @@ from sqlalchemy import Engine, create_engine, text
 from event_pipeline.config import Settings
 from event_pipeline.data.engine import make_engine
 from event_pipeline.data.tables import order_aggregates
-from event_pipeline.main import create_app
-from tests.api.helpers import FakePublisher, error_of, send
+from tests.api.helpers import FakePublisher, error_of, make_app, send
 
 NOON = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
 MINUTE = timedelta(minutes=1)
@@ -57,7 +56,7 @@ def insert(migrated_engine: Engine) -> Callable[..., None]:
 
 @pytest.fixture
 def app(migrated_engine: Engine) -> FastAPI:
-    return create_app(FakePublisher(), engine=migrated_engine)
+    return make_app(FakePublisher(), engine=migrated_engine)
 
 
 def query(app: FastAPI, store_id: str, **params: str) -> Any:
@@ -180,7 +179,7 @@ def test_windows_come_back_in_utc_whatever_the_session_time_zone(
         assert connection.execute(text("SHOW timezone")).scalar_one() == "Asia/Kolkata"
     store_id = new_store()
     insert(store_id, (NOON, "EUR", 1, 100))
-    app = create_app(FakePublisher(), engine=kolkata_engine)
+    app = make_app(FakePublisher(), engine=kolkata_engine)
 
     rows = query(app, store_id, **{"from": "2026-11-22T12:00:00Z", "to": "2026-11-22T12:01:00Z"})
 
@@ -199,8 +198,11 @@ def test_a_query_past_the_statement_timeout_answers_503(
     locker = migrated_engine.connect()
     try:
         locker.begin()
+        # If the statement timeout were ever missing, the select would wait on this lock forever and
+        # the job would hang: PostgreSQL ends this session after 5 s instead, and the test fails.
+        locker.execute(text("SET idle_in_transaction_session_timeout = '5s'"))
         locker.execute(text("LOCK TABLE order_aggregates IN ACCESS EXCLUSIVE MODE"))
-        app = create_app(FakePublisher(), engine=engine)
+        app = make_app(FakePublisher(), engine=engine)
 
         with caplog.at_level(logging.WARNING, logger="event_pipeline.api.errors"):
             response = send(

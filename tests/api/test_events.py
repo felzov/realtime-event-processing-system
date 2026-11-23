@@ -16,8 +16,7 @@ from starlette.types import Message, Scope
 
 from event_pipeline.broker.publisher import Delivery, NotDelivered, PublishFailure
 from event_pipeline.domain.events import MAX_BODY_BYTES
-from event_pipeline.main import create_app
-from tests.api.helpers import FakePublisher, error_of, no_database, send
+from tests.api.helpers import FakePublisher, error_of, make_app, send
 from tests.samples import EVENT_ID, STORE_ID, encode, valid_event
 
 # Distinctive text placed in rejected input; no response may contain it.
@@ -32,7 +31,7 @@ def test_valid_event_is_published_as_sent_and_answered_202() -> None:
     raw = encode(valid_event())
 
     before = datetime.now(UTC)
-    response = send(create_app(publisher, engine=no_database()), content=raw)
+    response = send(make_app(publisher), content=raw)
     after = datetime.now(UTC)
 
     assert response.status_code == 202
@@ -50,7 +49,7 @@ def test_body_of_exactly_the_cap_is_accepted() -> None:
     raw += b" " * (MAX_BODY_BYTES - len(raw))
     publisher = FakePublisher()
 
-    response = send(create_app(publisher, engine=no_database()), content=raw)
+    response = send(make_app(publisher), content=raw)
 
     assert response.status_code == 202
     assert publisher.calls[0].value == raw
@@ -64,7 +63,7 @@ def test_body_is_published_byte_for_byte_not_reserialised() -> None:
     assert raw != encode(event)
     publisher = FakePublisher()
 
-    response = send(create_app(publisher, engine=no_database()), content=raw)
+    response = send(make_app(publisher), content=raw)
 
     assert response.status_code == 202
     assert publisher.calls[0].value == raw
@@ -105,7 +104,7 @@ def test_invalid_event_is_422_with_domain_codes_and_not_published(
 ) -> None:
     publisher = FakePublisher()
 
-    response = send(create_app(publisher, engine=no_database()), content=raw)
+    response = send(make_app(publisher), content=raw)
 
     assert response.status_code == 422
     error = error_of(response)
@@ -120,7 +119,7 @@ def test_rejection_never_echoes_input() -> None:
     event["source"] = MARKER
     event[MARKER] = MARKER
 
-    response = send(create_app(FakePublisher(), engine=no_database()), content=encode(event))
+    response = send(make_app(FakePublisher()), content=encode(event))
 
     assert response.status_code == 422
     assert MARKER not in response.text
@@ -144,7 +143,7 @@ def test_declared_length_over_the_cap_is_413_without_reading_the_body() -> None:
             yield b" "
 
     response = send(
-        create_app(publisher, engine=no_database()),
+        make_app(publisher),
         content=body(),
         headers={"Content-Length": str(MAX_BODY_BYTES + 1)},
     )
@@ -163,7 +162,7 @@ def test_content_length_with_too_many_digits_is_413_not_500() -> None:
         yield b"{}"
 
     response = send(
-        create_app(FakePublisher(), engine=no_database()),
+        make_app(FakePublisher()),
         content=body(),
         headers={"Content-Length": "9" * 5000},
     )
@@ -185,7 +184,7 @@ def test_streamed_body_over_the_cap_is_413_and_reading_stops_at_the_cap() -> Non
             chunks_read += 1
             yield chunk
 
-    response = send(create_app(publisher, engine=no_database()), content=body())
+    response = send(make_app(publisher), content=body())
 
     assert response.status_code == 413
     assert error_of(response)["code"] == "body_too_large"
@@ -195,9 +194,7 @@ def test_streamed_body_over_the_cap_is_413_and_reading_stops_at_the_cap() -> Non
 
 
 def test_body_one_byte_over_the_cap_is_413() -> None:
-    response = send(
-        create_app(FakePublisher(), engine=no_database()), content=b" " * (MAX_BODY_BYTES + 1)
-    )
+    response = send(make_app(FakePublisher()), content=b" " * (MAX_BODY_BYTES + 1))
 
     assert response.status_code == 413
 
@@ -233,7 +230,7 @@ def test_unconfirmed_publish_maps_to_its_status(
 ) -> None:
     publisher = FakePublisher(outcome)
 
-    response = send(create_app(publisher, engine=no_database()), content=encode(valid_event()))
+    response = send(make_app(publisher), content=encode(valid_event()))
 
     assert response.status_code == status
     error = error_of(response)
@@ -250,7 +247,7 @@ def test_unconfirmed_publish_is_logged_with_event_id_and_cause_but_not_the_event
     publisher = FakePublisher(NotDelivered(PublishFailure.BROKER_UNAVAILABLE, "_MSG_TIMED_OUT"))
 
     with caplog.at_level(logging.WARNING, logger="event_pipeline.services.ingest"):
-        send(create_app(publisher, engine=no_database()), content=encode(valid_event()))
+        send(make_app(publisher), content=encode(valid_event()))
 
     [record] = caplog.records
     assert record.levelno == logging.WARNING
@@ -265,7 +262,7 @@ def test_failure_other_than_unavailable_is_logged_as_error(
     publisher = FakePublisher(NotDelivered(PublishFailure.REJECTED, "MSG_SIZE_TOO_LARGE"))
 
     with caplog.at_level(logging.WARNING, logger="event_pipeline.services.ingest"):
-        send(create_app(publisher, engine=no_database()), content=encode(valid_event()))
+        send(make_app(publisher), content=encode(valid_event()))
 
     [record] = caplog.records
     assert record.levelno == logging.ERROR
@@ -275,7 +272,7 @@ def test_unexpected_exception_is_500_in_the_envelope() -> None:
     publisher = FakePublisher(RuntimeError(MARKER))
 
     response = send(
-        create_app(publisher, engine=no_database()),
+        make_app(publisher),
         raise_app_exceptions=False,
         content=encode(valid_event()),
     )
@@ -290,7 +287,7 @@ def test_outcome_that_is_not_a_delivery_is_500_not_202() -> None:
     publisher = FakePublisher(cast(Delivery, object()))
 
     response = send(
-        create_app(publisher, engine=no_database()),
+        make_app(publisher),
         raise_app_exceptions=False,
         content=encode(valid_event()),
     )
@@ -332,7 +329,7 @@ def test_client_disconnecting_mid_body_is_not_a_server_error(
 
     with caplog.at_level(logging.INFO):
         # An exception escaping the app is what uvicorn logs as an ERROR traceback.
-        asyncio.run(create_app(publisher, engine=no_database())(scope, receive, send_message))
+        asyncio.run(make_app(publisher)(scope, receive, send_message))
 
     assert publisher.calls == []
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
@@ -343,7 +340,7 @@ def test_client_disconnecting_mid_body_is_not_a_server_error(
 
 
 def test_unknown_path_is_404_in_the_envelope() -> None:
-    response = send(create_app(FakePublisher(), engine=no_database()), path=f"/{MARKER}")
+    response = send(make_app(FakePublisher()), path=f"/{MARKER}")
 
     assert response.status_code == 404
     assert error_of(response)["code"] == "not_found"
@@ -351,7 +348,7 @@ def test_unknown_path_is_404_in_the_envelope() -> None:
 
 
 def test_wrong_method_is_405_with_allow_header() -> None:
-    response = send(create_app(FakePublisher(), engine=no_database()), method="GET")
+    response = send(make_app(FakePublisher()), method="GET")
 
     assert response.status_code == 405
     assert error_of(response)["code"] == "method_not_allowed"

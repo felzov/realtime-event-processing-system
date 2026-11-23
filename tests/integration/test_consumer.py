@@ -30,8 +30,8 @@ from event_pipeline.config import Settings
 from event_pipeline.consumer.loop import CommittedPartition, run
 from event_pipeline.data.tables import order_aggregates
 from event_pipeline.domain.events import OrderPlacedEvent
-from event_pipeline.main import create_app
 from event_pipeline.services.aggregation import ApplyOutcome, apply_order_placed
+from tests.api.helpers import make_app
 from tests.integration.test_ingest_api import post_event
 from tests.samples import encode, valid_event
 
@@ -258,7 +258,7 @@ def test_events_posted_to_the_api_end_up_in_the_aggregates_once(
     ]
     publisher = EventPublisher.from_settings(settings)
     try:
-        app = create_app(publisher, engine=migrated_engine)
+        app = make_app(publisher, engine=migrated_engine)
         for body in bodies:
             assert post_event(app, encode(body)).status_code == 202
     finally:

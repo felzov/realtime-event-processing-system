@@ -63,8 +63,9 @@ class Settings(BaseSettings):
     # should reach it, so it must outlast the delivery timeout by BACKSTOP_MARGIN_MS.
     publish_backstop_s: float = Field(default=10.0, gt=0)
 
-    # Bound on the broker metadata request behind `/ready`, so a probe against an unreachable
-    # broker answers 503 in about this long instead of hanging.
+    # Bound on each check behind `/ready`, so a probe against an unreachable broker or database
+    # answers 503 instead of hanging: the broker metadata request, and the readiness engine's
+    # statement timeout and connect timeout (rounded up to whole seconds, at least libpq's 2 s).
     ready_timeout_s: float = Field(default=2.0, gt=0)
     # On shutdown, how long to wait for delivery reports still outstanding (ADR 0003,
     # decision 10). Messages still without a report after it may or may not reach the broker.

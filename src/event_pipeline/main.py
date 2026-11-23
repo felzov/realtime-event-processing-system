@@ -1,12 +1,13 @@
 """Application factories.
 
-`create_app(publisher, engine=...)`: the caller owns the publisher and the engine (it creates them
-before the app and closes them after). The tests use it with fakes or real ones; creating an engine
-does not connect, so tests that never query can pass one for a database that does not exist.
+`create_app(publisher, engine=..., database_readiness=...)`: the caller owns all three (it creates
+them before the app and closes them after). The tests use it with fakes or real ones; creating an
+engine does not connect, so tests that never query can pass one for a database that does not exist.
 
 `create_app_from_settings()`: what `make run` serves (`uvicorn --factory`). Its lifespan creates
-the `EventPublisher` and the engine from settings on startup and closes both on shutdown, after the
-server has stopped taking requests and the ones in flight have finished (ADR 0003, decision 10).
+the `EventPublisher`, the engine and the readiness engine from settings on startup and closes them
+on shutdown, after the server has stopped taking requests and the ones in flight have finished
+(ADR 0003, decision 10).
 """
 
 import asyncio
@@ -23,8 +24,9 @@ from event_pipeline.api.dependencies import ReadinessProbe
 from event_pipeline.api.errors import register_error_handlers
 from event_pipeline.broker.publisher import EventPublisher
 from event_pipeline.config import DEFAULT_QUERY_MAX_RANGE_S, Settings
-from event_pipeline.data.engine import make_engine
+from event_pipeline.data.engine import make_engine, make_readiness_engine
 from event_pipeline.services.ingest import Publisher
+from event_pipeline.services.readiness import DatabaseReadiness
 
 type Lifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
 
@@ -37,11 +39,13 @@ def create_app(
     publisher: PublisherWithReadiness,
     *,
     engine: Engine,
+    database_readiness: ReadinessProbe,
     query_max_range: timedelta = timedelta(seconds=DEFAULT_QUERY_MAX_RANGE_S),
 ) -> FastAPI:
     app = _new_app(lifespan=None)
     app.state.publisher = publisher
     app.state.engine = engine
+    app.state.database_readiness = database_readiness
     app.state.query_max_range = query_max_range
     return app
 
@@ -52,10 +56,13 @@ def create_app_from_settings(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Created first: it holds nothing to close, so a failure creating the publisher after it
-        # leaves nothing open. It does not connect: queries answer 503 while PostgreSQL is down.
+        # The engines first: they hold nothing to close until used, so a failure creating the
+        # publisher after them leaves nothing open. Neither connects: queries and `/ready` answer
+        # 503 while PostgreSQL is down.
         engine = make_engine(resolved)
         app.state.engine = engine
+        readiness_engine = make_readiness_engine(resolved)
+        app.state.database_readiness = DatabaseReadiness(readiness_engine)
         # Creating the producer does not connect either: the app starts even if the broker is
         # down, and `/ready` answers 503 until it is reachable.
         publisher = EventPublisher.from_settings(resolved)
@@ -68,8 +75,10 @@ def create_app_from_settings(settings: Settings | None = None) -> FastAPI:
                 # `close()` blocks for up to the flush timeout; a worker thread keeps the loop free.
                 await asyncio.to_thread(publisher.close, resolved.publisher_close_timeout_s)
             finally:
-                # Closes the pooled connections; the in-flight requests have finished by now.
+                # Closes the pooled connections; the in-flight requests have finished by now. The
+                # readiness engine pools nothing, so disposing it only releases the object.
                 await asyncio.to_thread(engine.dispose)
+                readiness_engine.dispose()
 
     return _new_app(lifespan)
 

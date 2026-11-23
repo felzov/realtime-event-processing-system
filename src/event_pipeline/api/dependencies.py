@@ -12,7 +12,8 @@ from event_pipeline.services.ingest import Publisher
 
 
 class ReadinessProbe(Protocol):
-    """What `/ready` needs from `broker.publisher.EventPublisher`; the API tests pass a fake."""
+    """What `/ready` needs from each of its checks: `broker.publisher.EventPublisher` and
+    `services.readiness.DatabaseReadiness`. The API tests pass fakes."""
 
     def unready_cause(self) -> str | None: ...
 
@@ -29,6 +30,11 @@ def _publisher(request: Request) -> Publisher:
 def _readiness(request: Request) -> ReadinessProbe:
     # The same object as the publisher: what `/ready` reports is whether it can publish.
     probe: ReadinessProbe = request.app.state.publisher
+    return probe
+
+
+def _database_readiness(request: Request) -> ReadinessProbe:
+    probe: ReadinessProbe = request.app.state.database_readiness
     return probe
 
 
@@ -75,6 +81,7 @@ async def _capped_body(request: Request) -> bytes:
 
 AppPublisher = Annotated[Publisher, Depends(_publisher)]
 AppReadiness = Annotated[ReadinessProbe, Depends(_readiness)]
+AppDatabaseReadiness = Annotated[ReadinessProbe, Depends(_database_readiness)]
 CappedBody = Annotated[bytes, Depends(_capped_body)]
 AppEngine = Annotated[Engine, Depends(_engine)]
 QueryMaxRange = Annotated[timedelta, Depends(_query_max_range)]

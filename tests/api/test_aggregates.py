@@ -22,8 +22,8 @@ from event_pipeline.api import aggregates
 from event_pipeline.config import Settings
 from event_pipeline.data.aggregates import WindowAggregate
 from event_pipeline.domain.queries import AggregateQuery
-from event_pipeline.main import create_app, create_app_from_settings
-from tests.api.helpers import NO_DATABASE_URL, FakePublisher, error_of, no_database, send
+from event_pipeline.main import create_app_from_settings
+from tests.api.helpers import NO_DATABASE_URL, FakePublisher, error_of, make_app, no_database, send
 
 PATH = "/stores/store-7/aggregates"
 VALID = {"from": "2026-11-22T12:00:00Z", "to": "2026-11-22T13:00:00Z"}
@@ -53,7 +53,7 @@ def service(monkeypatch: pytest.MonkeyPatch) -> FakeService:
 
 
 def app(**kwargs: Any) -> FastAPI:
-    return create_app(FakePublisher(), engine=no_database(), **kwargs)
+    return make_app(FakePublisher(), engine=no_database(), **kwargs)
 
 
 def get(application: FastAPI, path: str = PATH, **params: str) -> Any:
