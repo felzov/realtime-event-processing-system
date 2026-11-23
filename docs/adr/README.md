@@ -10,5 +10,5 @@ the same file.
 | [0002](0002-broker-and-client-stack.md) | Broker and client stack | Accepted |
 | [0003](0003-ingest-acknowledgement.md) | Ingest acknowledgement | Accepted |
 | [0004](0004-offsets-and-database.md) | Offsets and database consistency | Accepted |
-| 0005 | Windows and late events | Planned (phase 4) |
+| [0005](0005-late-events.md) | Late and future events | Accepted |
 | 0006 | Dead letters and replay | Planned (phase 6) |

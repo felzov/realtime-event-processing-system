@@ -120,6 +120,14 @@ The primary key is the table's only index, and the query API reads one store ove
 `window_start`, sorted by `window_start` then `currency`: in this order that is one index range
 scan, already sorted. Deduplicating and upserting do not depend on the order.
 
+**Update 2026-11-23 (phase 4, slice 1):** decision 4 no longer holds in full. `received_at` now
+also decides whether an event counts at all: [ADR 0005](0005-late-events.md) skips an event that
+reached ingest more than the allowed lateness after its `occurred_at`, or whose `occurred_at` is
+too far after its `received_at` (from the future). It still never decides the window, which
+decision 1 assigns by `occurred_at` alone. The reason codes of decision 7 gain three codes for
+valid events the consumer does not count (`late_event`, `future_event`, `invalid_received_at`);
+they are not rejection codes at the ingest boundary.
+
 ## Consequences
 
 - A client that retries after a timeout must resend the same `event_id`. A client that generates a
