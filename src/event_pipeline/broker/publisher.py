@@ -105,6 +105,24 @@ def format_received_at(received_at: datetime) -> bytes:
     return received_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ").encode("ascii")
 
 
+def parse_received_at(value: bytes | None) -> datetime:
+    """The inverse of `format_received_at`; anything else raises `ValueError`.
+
+    Only the exact form the ingest API writes is accepted, so a header written by another producer
+    in some other form is refused rather than guessed at (ADR 0005).
+    """
+    if value is None:
+        raise ValueError("received_at is missing")
+    # UnicodeDecodeError is a ValueError.
+    text = value.decode("ascii")
+    parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    # strptime also accepts shorter forms (one-digit months, fewer microsecond digits): writing
+    # the value back must give the same bytes.
+    if format_received_at(parsed) != value:
+        raise ValueError("received_at is not in the ingest API's format")
+    return parsed
+
+
 class EventPublisher:
     """Produces to one topic and awaits each delivery report, bounded by a backstop."""
 

@@ -1,4 +1,5 @@
 import re
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -244,3 +245,49 @@ def test_env_example_lists_every_setting_with_its_default() -> None:
 
     assert names == set(Settings.model_fields)
     assert from_example == make_settings()
+
+
+def test_the_lateness_policy_comes_from_the_settings() -> None:
+    settings = make_settings(allowed_lateness_s=90.5, max_future_skew_s=0)
+
+    policy = settings.lateness_policy()
+
+    assert policy.allowed_lateness == timedelta(seconds=90.5)
+    assert policy.max_future_skew == timedelta(0)
+
+
+def test_the_default_lateness_policy() -> None:
+    policy = make_settings().lateness_policy()
+
+    assert policy.allowed_lateness == timedelta(minutes=5)
+    assert policy.max_future_skew == timedelta(minutes=1)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"allowed_lateness_s": 0}, {"allowed_lateness_s": -1}, {"max_future_skew_s": -1}],
+    ids=["zero_lateness", "negative_lateness", "negative_skew"],
+)
+def test_a_lateness_setting_that_would_drop_every_event_is_refused(
+    overrides: dict[str, float],
+) -> None:
+    with pytest.raises(ValidationError):
+        make_settings(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"allowed_lateness_s": 1e-7},
+        {"allowed_lateness_s": 1e14},
+        {"allowed_lateness_s": float("inf")},
+        {"max_future_skew_s": float("inf")},
+    ],
+    ids=["rounds_to_zero", "overflows_timedelta", "inf_lateness", "inf_skew"],
+)
+def test_a_lateness_setting_that_cannot_become_a_policy_is_refused_at_load(
+    overrides: dict[str, float],
+) -> None:
+    # Refused when the settings load, not later when the consumer or the API builds the policy.
+    with pytest.raises(ValidationError):
+        make_settings(**overrides)

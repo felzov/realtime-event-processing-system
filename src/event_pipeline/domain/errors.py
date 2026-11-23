@@ -20,6 +20,11 @@ class ReasonCode(StrEnum):
     UNSUPPORTED_SCHEMA_VERSION = "unsupported_schema_version"
     BODY_TOO_LARGE = "body_too_large"
     INVALID_JSON = "invalid_json"
+    # Why a valid event does not change an aggregate (ADR 0005): it reached ingest too late, it
+    # claims a time too far after it reached ingest, or its received_at header is missing or bad.
+    LATE_EVENT = "late_event"
+    FUTURE_EVENT = "future_event"
+    INVALID_RECEIVED_AT = "invalid_received_at"
 
 
 ROOT_PATH = "<body>"
