@@ -21,6 +21,9 @@ BACKSTOP_MARGIN_MS = 2_000
 # between versions (psycopg2 in 2.0, psycopg in 2.1).
 DATABASE_DRIVER = "postgresql+psycopg"
 
+# 24 h; also the default of `create_app`, which the tests call without settings.
+DEFAULT_QUERY_MAX_RANGE_S = 86_400
+
 # Statements one applied event can run: the pool's pre-ping, the processed_events insert, the
 # aggregate upsert and COMMIT (services/aggregation.py).
 DB_STATEMENTS_PER_EVENT = 4
@@ -66,6 +69,9 @@ class Settings(BaseSettings):
     # On shutdown, how long to wait for delivery reports still outstanding (ADR 0003,
     # decision 10). Messages still without a report after it may or may not reach the broker.
     publisher_close_timeout_s: float = Field(default=5.0, gt=0)
+    # The longest range `[from, to)` one aggregate query may ask for. It bounds the rows of one
+    # response: one per minute window and currency, so 1440 windows per currency by default.
+    query_max_range_s: int = Field(default=DEFAULT_QUERY_MAX_RANGE_S, gt=0)
 
     # The default is the local Compose database (compose.yaml); its password is a fixed development
     # value, not a secret. A SecretStr keeps the URL, password included, out of reprs and logs.

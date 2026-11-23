@@ -1,8 +1,9 @@
 """The error envelope and the exception handlers that produce it (ADR 0003, decision 7).
 
 Every error response is `{"error": {"code", "message", "violations"}}`. `violations` lists
-`{path, code}` pairs for a rejected event and is empty otherwise. Messages are fixed strings: they
-never echo the request, and the Kafka cause of a failed publish is logged, not returned.
+`{path, code}` pairs for a rejected event or invalid query parameters and is empty otherwise.
+Messages are fixed strings: they never echo the request, and the Kafka or database cause of a
+failure is logged, not returned.
 """
 
 import logging
@@ -15,11 +16,14 @@ from typing import Final, cast
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import DBAPIError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect
 
 from event_pipeline.broker.publisher import PublishFailure
-from event_pipeline.domain.errors import EventRejectedError
+from event_pipeline.data.errors import describe_database_error
+from event_pipeline.domain.errors import EventRejectedError, QueryRejectedError
 from event_pipeline.domain.events import MAX_BODY_BYTES
 from event_pipeline.services.ingest import EventNotConfirmedError
 
@@ -37,6 +41,7 @@ class ApiErrorCode(StrEnum):
     METHOD_NOT_ALLOWED = "method_not_allowed"
     INVALID_REQUEST = "invalid_request"
     NOT_READY = "not_ready"
+    DATABASE_UNAVAILABLE = "database_unavailable"
 
 
 class BodyTooLargeError(Exception):
@@ -73,6 +78,16 @@ INGEST_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
     },
 }
 
+# OpenAPI entries for the aggregate query; the handlers below produce them.
+QUERY_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ErrorResponse},
+    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
+    status.HTTP_503_SERVICE_UNAVAILABLE: {
+        "model": ErrorResponse,
+        "description": "The database did not answer in time; retry later",
+    },
+}
+
 # Routing raises these itself (unknown path, wrong method).
 _HTTP_EXCEPTION_CODES: Final[Mapping[int, ApiErrorCode]] = MappingProxyType(
     {
@@ -104,6 +119,33 @@ async def _handle_event_rejected(request: Request, exc: Exception) -> JSONRespon
         "the event does not satisfy the contract",
         [ViolationBody(path=v.path, code=v.code) for v in error.violations],
     )
+
+
+async def _handle_query_rejected(request: Request, exc: Exception) -> JSONResponse:
+    error = cast(QueryRejectedError, exc)
+    return error_response(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        ApiErrorCode.INVALID_REQUEST,
+        "the query parameters are invalid",
+        [ViolationBody(path=v.path, code=v.code) for v in error.violations],
+    )
+
+
+async def _handle_database_error(request: Request, exc: Exception) -> JSONResponse:
+    # Handled here, not by the catch-all: that one lets the server log the traceback, which prints
+    # str(exc), and a database message can carry stored values.
+    described = describe_database_error(exc) if isinstance(exc, DBAPIError) else type(exc).__name__
+    # Unreachable server, broken connection, statement timeout (QueryCanceled is an
+    # OperationalError) or no free pooled connection: the database is unavailable for now.
+    if isinstance(exc, OperationalError | PoolTimeoutError):
+        logger.warning("database unavailable: %s", described)
+        return error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            ApiErrorCode.DATABASE_UNAVAILABLE,
+            "the database did not answer; retry later",
+        )
+    logger.error("database error: %s", described)
+    return _internal_error()
 
 
 async def _handle_body_too_large(request: Request, exc: Exception) -> JSONResponse:
@@ -174,6 +216,9 @@ def _internal_error() -> JSONResponse:
 
 def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(EventRejectedError, _handle_event_rejected)
+    app.add_exception_handler(QueryRejectedError, _handle_query_rejected)
+    app.add_exception_handler(DBAPIError, _handle_database_error)
+    app.add_exception_handler(PoolTimeoutError, _handle_database_error)
     app.add_exception_handler(BodyTooLargeError, _handle_body_too_large)
     app.add_exception_handler(EventNotConfirmedError, _handle_not_confirmed)
     app.add_exception_handler(NotReadyError, _handle_not_ready)

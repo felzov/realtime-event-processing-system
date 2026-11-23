@@ -1,7 +1,7 @@
 """A fake publisher and an in-process client for the API tests.
 
 Requests go through httpx's `ASGITransport`, which does not run the app's lifespan: the app from
-`create_app(publisher)` needs none.
+`create_app(publisher, engine=...)` needs none.
 """
 
 import asyncio
@@ -11,10 +11,24 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI
+from pydantic import SecretStr
+from sqlalchemy import Engine
 
 from event_pipeline.broker.publisher import Delivered, Delivery
+from event_pipeline.config import Settings
+from event_pipeline.data.engine import make_engine
 
 DELIVERED = Delivered(partition=3, offset=41)
+
+# Port 1 on 127.0.0.1: nothing listens. Creating an engine does not connect, so tests that never
+# query are unaffected, and one that does gets a refused connection at once, never a real database.
+NO_DATABASE_URL = "postgresql+psycopg://nobody@127.0.0.1:1/no_database_test"
+
+
+def no_database() -> Engine:
+    """The application's engine (`make_engine`) for a database that does not exist."""
+    settings = Settings(_env_file=None, database_url=SecretStr(NO_DATABASE_URL))  # type: ignore[call-arg]
+    return make_engine(settings)
 
 
 @dataclass(frozen=True, slots=True)

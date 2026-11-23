@@ -14,6 +14,7 @@ from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, Delivered, Deliv
 from event_pipeline.broker.topics import TopicSpec, ensure_topic
 from event_pipeline.config import Settings
 from event_pipeline.main import create_app, create_app_from_settings
+from tests.api.helpers import no_database
 from tests.integration.kafka_helpers import read_at
 from tests.samples import EVENT_ID, STORE_ID, encode, valid_event
 
@@ -66,7 +67,7 @@ def test_accepted_event_is_on_the_topic_byte_for_byte(
     raw = encode(valid_event())
 
     before = datetime.now(UTC)
-    response = post_event(create_app(publisher), raw)
+    response = post_event(create_app(publisher, engine=no_database()), raw)
     after = datetime.now(UTC)
 
     assert response.status_code == 202
@@ -101,7 +102,7 @@ def test_unreachable_broker_answers_503_in_bounded_time(unique_topic: Callable[[
     publisher = EventPublisher.from_settings(settings)
     try:
         started = time.monotonic()
-        response = post_event(create_app(publisher), encode(valid_event()))
+        response = post_event(create_app(publisher, engine=no_database()), encode(valid_event()))
         elapsed = time.monotonic() - started
     finally:
         publisher.close(timeout_s=1.0)

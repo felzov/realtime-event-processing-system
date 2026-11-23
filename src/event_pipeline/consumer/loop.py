@@ -29,6 +29,7 @@ from uuid import UUID
 from confluent_kafka import KafkaError, KafkaException
 from sqlalchemy.exc import DBAPIError
 
+from event_pipeline.data.errors import describe_database_error
 from event_pipeline.domain.errors import EventRejectedError
 from event_pipeline.domain.events import OrderPlacedEvent, parse_event
 from event_pipeline.services.aggregation import ApplyOutcome
@@ -171,15 +172,7 @@ def describe_error(exc: BaseException) -> str:
     message contents.
     """
     if isinstance(exc, DBAPIError):
-        driver_error = exc.orig
-        parts = [type(exc).__name__, type(driver_error).__name__]
-        sqlstate = getattr(driver_error, "sqlstate", None)
-        if sqlstate:
-            parts.append(f"sqlstate={sqlstate}")
-        constraint = getattr(getattr(driver_error, "diag", None), "constraint_name", None)
-        if constraint:
-            parts.append(f"constraint={constraint}")
-        return " ".join(parts)
+        return describe_database_error(exc)
     if isinstance(exc, KafkaException) and exc.args and isinstance(exc.args[0], KafkaError):
         return f"KafkaException {_kafka_error(exc.args[0])}"
     if isinstance(exc, OffsetCommitError):

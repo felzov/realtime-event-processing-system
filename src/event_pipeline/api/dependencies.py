@@ -1,8 +1,10 @@
-"""FastAPI dependencies: the publisher `create_app` stores on `app.state`, and the capped body."""
+"""FastAPI dependencies: what `create_app` stores on `app.state`, and the capped body."""
 
+from datetime import timedelta
 from typing import Annotated, Protocol
 
 from fastapi import Depends, Request
+from sqlalchemy import Engine
 
 from event_pipeline.api.errors import BodyTooLargeError
 from event_pipeline.domain.events import MAX_BODY_BYTES
@@ -28,6 +30,16 @@ def _readiness(request: Request) -> ReadinessProbe:
     # The same object as the publisher: what `/ready` reports is whether it can publish.
     probe: ReadinessProbe = request.app.state.publisher
     return probe
+
+
+def _engine(request: Request) -> Engine:
+    engine: Engine = request.app.state.engine
+    return engine
+
+
+def _query_max_range(request: Request) -> timedelta:
+    max_range: timedelta = request.app.state.query_max_range
+    return max_range
 
 
 async def _capped_body(request: Request) -> bytes:
@@ -64,3 +76,5 @@ async def _capped_body(request: Request) -> bytes:
 AppPublisher = Annotated[Publisher, Depends(_publisher)]
 AppReadiness = Annotated[ReadinessProbe, Depends(_readiness)]
 CappedBody = Annotated[bytes, Depends(_capped_body)]
+AppEngine = Annotated[Engine, Depends(_engine)]
+QueryMaxRange = Annotated[timedelta, Depends(_query_max_range)]

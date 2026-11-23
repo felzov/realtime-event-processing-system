@@ -258,7 +258,7 @@ def test_events_posted_to_the_api_end_up_in_the_aggregates_once(
     ]
     publisher = EventPublisher.from_settings(settings)
     try:
-        app = create_app(publisher)
+        app = create_app(publisher, engine=migrated_engine)
         for body in bodies:
             assert post_event(app, encode(body)).status_code == 202
     finally:

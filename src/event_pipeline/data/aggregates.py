@@ -1,13 +1,15 @@
-"""The two statements of the apply transaction (ADR 0004, decision 2).
+"""The statements on the aggregate tables.
 
+The two statements of the apply transaction (ADR 0004, decision 2) and the query API's select.
 Each takes a `Connection` that is already in a transaction and neither commits nor rolls back:
-`services/aggregation.py` owns the transaction, so both statements commit or neither does.
+`services/` owns the transaction, so both apply statements commit or neither does.
 """
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import Connection, func
+from sqlalchemy import Connection, func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from event_pipeline.data.tables import order_aggregates, processed_events
@@ -56,3 +58,46 @@ def add_order_to_aggregate(
         },
     )
     connection.execute(statement)
+
+
+@dataclass(frozen=True, slots=True)
+class WindowAggregate:
+    """One row of order_aggregates, as the query API returns it; `window_start` is in UTC."""
+
+    window_start: datetime
+    currency: str
+    order_count: int
+    revenue_minor: int
+
+
+def select_store_aggregates(
+    connection: Connection,
+    *,
+    store_id: str,
+    start: datetime,
+    end: datetime,
+    currency: str | None,
+) -> list[WindowAggregate]:
+    """The store's rows with `start <= window_start < end`, by window_start, then currency.
+
+    The primary key (store_id, window_start, currency) serves both the filter and the order: one
+    index range scan, no sort.
+    """
+    table = order_aggregates.c
+    statement = (
+        select(table.window_start, table.currency, table.order_count, table.revenue_minor)
+        .where(table.store_id == store_id, table.window_start >= start, table.window_start < end)
+        .order_by(table.window_start, table.currency)
+    )
+    if currency is not None:
+        statement = statement.where(table.currency == currency)
+    return [
+        WindowAggregate(
+            # timestamptz comes back in the session's time zone; the API speaks UTC.
+            window_start=row.window_start.astimezone(UTC),
+            currency=row.currency,
+            order_count=row.order_count,
+            revenue_minor=row.revenue_minor,
+        )
+        for row in connection.execute(statement)
+    ]

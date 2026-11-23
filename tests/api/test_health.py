@@ -9,13 +9,13 @@ import pytest
 
 from event_pipeline.config import Settings
 from event_pipeline.main import create_app, create_app_from_settings
-from tests.api.helpers import FakePublisher, error_of, send
+from tests.api.helpers import FakePublisher, error_of, no_database, send
 
 CAUSE = "UNKNOWN_TOPIC_OR_PART"
 
 
 def test_health_answers_200() -> None:
-    response = send(create_app(FakePublisher()), method="GET", path="/health")
+    response = send(create_app(FakePublisher(), engine=no_database()), method="GET", path="/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
@@ -23,13 +23,17 @@ def test_health_answers_200() -> None:
 
 def test_health_answers_200_while_not_ready() -> None:
     # Liveness must not depend on the broker, or an outage would get a healthy process restarted.
-    response = send(create_app(FakePublisher(unready_cause=CAUSE)), method="GET", path="/health")
+    response = send(
+        create_app(FakePublisher(unready_cause=CAUSE), engine=no_database()),
+        method="GET",
+        path="/health",
+    )
 
     assert response.status_code == 200
 
 
 def test_ready_answers_200_when_the_publisher_can_publish() -> None:
-    response = send(create_app(FakePublisher()), method="GET", path="/ready")
+    response = send(create_app(FakePublisher(), engine=no_database()), method="GET", path="/ready")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
@@ -39,7 +43,11 @@ def test_not_ready_answers_503_and_logs_the_cause_without_returning_it(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING, logger="event_pipeline.api.health"):
-        response = send(create_app(FakePublisher(unready_cause=CAUSE)), method="GET", path="/ready")
+        response = send(
+            create_app(FakePublisher(unready_cause=CAUSE), engine=no_database()),
+            method="GET",
+            path="/ready",
+        )
 
     assert response.status_code == 503
     error = error_of(response)
@@ -59,7 +67,7 @@ class _SlowProbe(FakePublisher):
 
 
 def test_a_slow_ready_check_does_not_block_other_requests() -> None:
-    app = create_app(_SlowProbe())
+    app = create_app(_SlowProbe(), engine=no_database())
 
     async def both() -> tuple[float, float]:
         transport = httpx.ASGITransport(app=app)

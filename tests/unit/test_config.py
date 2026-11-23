@@ -77,6 +77,7 @@ def test_backstop_with_2s_margin_is_accepted() -> None:
         {"consumer_poll_timeout_s": 0},
         {"consumer_max_poll_interval_ms": 0},
         {"consumer_close_timeout_s": 0},
+        {"query_max_range_s": 0},
     ],
     ids=[
         "topic_with_space",
@@ -96,6 +97,7 @@ def test_backstop_with_2s_margin_is_accepted() -> None:
         "zero_poll_timeout",
         "zero_max_poll_interval",
         "zero_consumer_close_timeout",
+        "zero_query_max_range",
     ],
 )
 def test_invalid_settings_are_rejected(overrides: dict[str, Any]) -> None:
