@@ -169,7 +169,7 @@ def _validate[M: BaseModel](
     try:
         return validate()
     except ValidationError as exc:
-        return _violations(exc.errors(), prefix)
+        return pydantic_violations(exc.errors(), prefix)
 
 
 class _DuplicateKeyError(Exception):
@@ -238,7 +238,13 @@ _REASON_BY_PYDANTIC_TYPE: Final[dict[str, ReasonCode]] = {
 }
 
 
-def _violations(errors: Sequence[ErrorDetails], prefix: tuple[str, ...]) -> tuple[Violation, ...]:
+def pydantic_violations(
+    errors: Sequence[ErrorDetails], prefix: tuple[str, ...]
+) -> tuple[Violation, ...]:
+    """Pydantic's errors as violations: a reason code and a dotted path each, never the input.
+
+    Also used for the query API's parameters (domain/queries.py), so both share one mapping.
+    """
     violations = []
     for error in errors:
         code = _REASON_BY_PYDANTIC_TYPE.get(error["type"], ReasonCode.INVALID_FORMAT)

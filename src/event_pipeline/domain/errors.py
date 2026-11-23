@@ -1,8 +1,8 @@
-"""Rejection reason codes for invalid events (ADR 0001, decision 7).
+"""Rejection reason codes for invalid events (ADR 0001, decision 7) and invalid queries.
 
 The codes are part of the public contract: clients and the dead-letter path see them, so a code is
 never renamed or reused for a different meaning. Messages built here contain only codes and field
-paths, never a submitted value.
+paths, never a submitted value. The query API reuses the same codes for its parameters.
 """
 
 from dataclasses import dataclass
@@ -40,5 +40,15 @@ class EventRejectedError(Exception):
     def __init__(self, violations: tuple[Violation, ...]) -> None:
         if not violations:
             raise ValueError("EventRejectedError needs at least one violation")
+        self.violations = violations
+        super().__init__("; ".join(f"{v.path}: {v.code}" for v in violations))
+
+
+class QueryRejectedError(Exception):
+    """The parameters of an aggregate query are invalid. Carries every violation found, in order."""
+
+    def __init__(self, violations: tuple[Violation, ...]) -> None:
+        if not violations:
+            raise ValueError("QueryRejectedError needs at least one violation")
         self.violations = violations
         super().__init__("; ".join(f"{v.path}: {v.code}" for v in violations))

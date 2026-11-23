@@ -114,6 +114,12 @@ partition is the key's hash modulo the partition count.
 [ADR 0003](0003-ingest-acknowledgement.md), decision 4: `received_at` travels as a Kafka header,
 so the message value stays the client's bytes.
 
+**Update 2026-11-22 (phase 3, slice 2):** decision 1's aggregate key is unchanged as a set of
+columns, but the table's primary key stores it in the order `(store_id, window_start, currency)`.
+The primary key is the table's only index, and the query API reads one store over a range of
+`window_start`, sorted by `window_start` then `currency`: in this order that is one index range
+scan, already sorted. Deduplicating and upserting do not depend on the order.
+
 ## Consequences
 
 - A client that retries after a timeout must resend the same `event_id`. A client that generates a

@@ -6,18 +6,36 @@ setup, not measured values.
 
 from typing import Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 # librdkafka checks message timeouts about once a second, so `_MSG_TIMED_OUT` can arrive up to about
 # a second after `delivery.timeout.ms` (5.6 s for 5000 ms in the ADR 0002 spike); waiting for the
 # poll that delivers the report adds a little more.
 BACKSTOP_MARGIN_MS = 2_000
 
+# The SQLAlchemy dialect and driver every DATABASE_URL must name: psycopg 3, synchronous (ADR 0002).
+# Named explicitly rather than left to SQLAlchemy's default for `postgresql://`, which has changed
+# between versions (psycopg2 in 2.0, psycopg in 2.1).
+DATABASE_DRIVER = "postgresql+psycopg"
+
+# 24 h; also the default of `create_app`, which the tests call without settings.
+DEFAULT_QUERY_MAX_RANGE_S = 86_400
+
+# Statements one applied event can run: the pool's pre-ping, the processed_events insert, the
+# aggregate upsert and COMMIT (services/aggregation.py).
+DB_STATEMENTS_PER_EVENT = 4
+# How many times that worst case must fit into max.poll.interval.ms, so it stays well under it.
+POLL_INTERVAL_MARGIN = 2
+# librdkafka's default session.timeout.ms, which max.poll.interval.ms may not be below.
+LIBRDKAFKA_SESSION_TIMEOUT_MS = 45_000
+
 
 class Settings(BaseSettings):
     # Unknown keys in `.env` are ignored. Validation errors would otherwise print the values read,
-    # so they are hidden; there are no secrets yet, but the database password arrives in phase 3.
+    # so they are hidden: DATABASE_URL contains the database password.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     # Comma-separated host:port list. Plaintext and unauthenticated: local development only.
@@ -45,12 +63,95 @@ class Settings(BaseSettings):
     # should reach it, so it must outlast the delivery timeout by BACKSTOP_MARGIN_MS.
     publish_backstop_s: float = Field(default=10.0, gt=0)
 
-    # Bound on the broker metadata request behind `/ready`, so a probe against an unreachable
-    # broker answers 503 in about this long instead of hanging.
+    # Bound on each check behind `/ready`, so a probe against an unreachable broker or database
+    # answers 503 instead of hanging: the broker metadata request, and the readiness engine's
+    # statement timeout and connect timeout (rounded up to whole seconds, at least libpq's 2 s).
     ready_timeout_s: float = Field(default=2.0, gt=0)
     # On shutdown, how long to wait for delivery reports still outstanding (ADR 0003,
     # decision 10). Messages still without a report after it may or may not reach the broker.
     publisher_close_timeout_s: float = Field(default=5.0, gt=0)
+    # The longest range `[from, to)` one aggregate query may ask for. It bounds the rows of one
+    # response: one per minute window and currency, so 1440 windows per currency by default.
+    query_max_range_s: int = Field(default=DEFAULT_QUERY_MAX_RANGE_S, gt=0)
+
+    # The default is the local Compose database (compose.yaml); its password is a fixed development
+    # value, not a secret. A SecretStr keeps the URL, password included, out of reprs and logs.
+    database_url: SecretStr = SecretStr(
+        f"{DATABASE_DRIVER}://event_pipeline:event_pipeline_local@127.0.0.1:5432/event_pipeline"
+    )
+    # libpq's connect_timeout, in whole seconds; libpq treats anything below 2 as 2.
+    db_connect_timeout_s: int = Field(default=5, ge=2)
+    # PostgreSQL's statement_timeout for every connection of the engine: a statement running longer
+    # is cancelled by the server, so no query can hang a request or the consumer loop.
+    db_statement_timeout_ms: int = Field(default=5_000, gt=0)
+    # How long a caller waits for a free connection from the engine's pool before an error.
+    db_pool_timeout_s: float = Field(default=5.0, gt=0)
+
+    # The consumer group of `make consumer`. Every consumer with this id shares the topic's
+    # partitions and the committed offsets; a new id re-reads the topic from the start (ADR 0004,
+    # decision 4), which the duplicates table makes harmless.
+    consumer_group_id: str = Field(
+        default="event-pipeline-aggregator", min_length=1, max_length=255
+    )
+    # How long one poll waits for a message. It also bounds how long a stop request waits when no
+    # messages arrive.
+    consumer_poll_timeout_s: float = Field(default=1.0, gt=0)
+    # librdkafka's max.poll.interval.ms: a consumer that does not poll again within it is removed
+    # from the group, and its partitions move to another consumer.
+    consumer_max_poll_interval_ms: int = Field(default=300_000, gt=0)
+    # From a stop request to the process exiting: finishing the current event, leaving the group.
+    # Past it the process exits anyway, with an error status (consumer/__main__.py).
+    consumer_close_timeout_s: float = Field(default=10.0, gt=0)
+
+    @field_validator("database_url")
+    @classmethod
+    def _database_url_names_the_driver(cls, value: SecretStr) -> SecretStr:
+        # Checked at startup so a wrong URL fails with a clear message instead of on first use. The
+        # message never contains the URL: SQLAlchemy's own ValueError for a bad port quotes the
+        # text it read as the port, which is the password when the host is missing or the password
+        # holds an unencoded `@`.
+        try:
+            url = make_url(value.get_secret_value())
+        except (ArgumentError, ValueError):
+            raise ValueError("database_url is not a valid database URL") from None
+        if url.drivername != DATABASE_DRIVER:
+            raise ValueError(f"database_url must start with {DATABASE_DRIVER}://")
+        if not url.database:
+            raise ValueError("database_url must name a database")
+        return value
+
+    @model_validator(mode="after")
+    def _one_event_fits_well_within_the_poll_interval(self) -> Self:
+        # The consumer polls again only after the event's transaction and offset commit. Their
+        # database part is bounded by the timeouts: waiting for a pooled connection, opening one,
+        # and up to DB_STATEMENTS_PER_EVENT statements. If that bound came near max.poll.interval,
+        # a slow but successful apply would get the consumer removed from its group mid-event.
+        # The offset commit after it is not in the bound: its time is set by librdkafka's own
+        # request and coordinator timeouts, not by a setting here; the margin is meant to absorb it.
+        apply_bound_ms = (
+            self.db_pool_timeout_s + self.db_connect_timeout_s
+        ) * 1000 + DB_STATEMENTS_PER_EVENT * self.db_statement_timeout_ms
+        if self.consumer_max_poll_interval_ms < LIBRDKAFKA_SESSION_TIMEOUT_MS:
+            # librdkafka refuses to create a consumer otherwise (session.timeout.ms is left at its
+            # default).
+            raise ValueError(
+                f"consumer_max_poll_interval_ms must be at least {LIBRDKAFKA_SESSION_TIMEOUT_MS} "
+                "(librdkafka's session.timeout.ms)"
+            )
+        if self.consumer_max_poll_interval_ms < POLL_INTERVAL_MARGIN * apply_bound_ms:
+            raise ValueError(
+                f"consumer_max_poll_interval_ms must be at least {POLL_INTERVAL_MARGIN} times the "
+                "worst-case database time of one event (pool + connect timeouts + "
+                f"{DB_STATEMENTS_PER_EVENT} x db_statement_timeout_ms)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _close_timeout_outlasts_a_poll(self) -> Self:
+        # Otherwise a stop request while waiting for messages could hit the close timeout.
+        if self.consumer_close_timeout_s <= self.consumer_poll_timeout_s:
+            raise ValueError("consumer_close_timeout_s must be longer than consumer_poll_timeout_s")
+        return self
 
     @model_validator(mode="after")
     def _backstop_outlasts_delivery_timeout(self) -> Self:

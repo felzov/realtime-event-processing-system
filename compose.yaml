@@ -1,5 +1,5 @@
 # Local services for development and integration tests. CI starts the same file, so local and CI
-# brokers cannot drift apart. PostgreSQL is added in phase 3.
+# services cannot drift apart.
 services:
   kafka:
     # ADR 0002: exact tag, pinned by digest.
@@ -44,5 +44,32 @@ services:
       retries: 12
       start_period: 30s
 
+  postgres:
+    # Exact tag, pinned by digest, like Kafka (ADR 0002).
+    image: postgres:19.0@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60
+    environment:
+      POSTGRES_USER: event_pipeline
+      # A fixed local-development password, not a secret: the port is published on 127.0.0.1 only
+      # and the database holds test data. The same value is the default DATABASE_URL (config.py).
+      POSTGRES_PASSWORD: event_pipeline_local
+      POSTGRES_DB: event_pipeline
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # From PostgreSQL 18 the image keeps its data in a version-named directory below
+      # /var/lib/postgresql, so the volume is mounted there, not at .../data.
+      - postgres-data:/var/lib/postgresql
+      # Creates event_pipeline_test on the first start with an empty volume.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Over TCP on purpose: while the init scripts run, the image's temporary server listens on
+      # its Unix socket only, so this passes only once initialisation (event_pipeline_test) is done.
+      test: ["CMD-SHELL", "pg_isready -U event_pipeline -d event_pipeline -h 127.0.0.1"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
 volumes:
   kafka-data:
+  postgres-data:

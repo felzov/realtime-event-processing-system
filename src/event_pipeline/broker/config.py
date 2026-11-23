@@ -26,3 +26,21 @@ def producer_config(settings: Settings) -> ClientConfig:
 
 def admin_config(settings: Settings) -> ClientConfig:
     return {"bootstrap.servers": settings.kafka_bootstrap_servers}
+
+
+def consumer_config(settings: Settings) -> ClientConfig:
+    """Configuration for the aggregating consumer (ADR 0002, decision 5; ADR 0004).
+
+    - `enable.auto.commit=false`: the loop commits each message's offset itself, after the
+      database transaction holding its effect has committed (ADR 0004, decisions 1 and 3).
+    - `auto.offset.reset=earliest`: a group with no committed offset starts at the beginning of
+      each partition, so events produced before the consumer first ran are counted (decision 4).
+    - The partition assignment strategy is librdkafka's default (decision 5).
+    """
+    return {
+        "bootstrap.servers": settings.kafka_bootstrap_servers,
+        "group.id": settings.consumer_group_id,
+        "enable.auto.commit": False,
+        "auto.offset.reset": "earliest",
+        "max.poll.interval.ms": settings.consumer_max_poll_interval_ms,
+    }

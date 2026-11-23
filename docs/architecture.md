@@ -99,12 +99,12 @@ business rules.
 | `domain/` | Event envelope and payload schemas, error codes, window assignment | 1 | Built |
 | Kafka in Docker Compose (`make up`, `make topics`) | Local broker; topic declared explicitly, auto-create off | 2 | Built |
 | `broker/` producer, ingest API (`POST /events`) | Validate, produce with `acks=all`, answer after the broker acknowledged | 2 | Built |
-| `/health`, `/ready` | Liveness; readiness of the broker, the topic and the producer's poll thread | 2 | Built (database and migration checks in phase 3) |
-| PostgreSQL in Docker Compose | Local database | 3 | Not built |
-| `data/` models and migrations | `aggregates` and `processed_events` tables | 3 | Not built |
-| `services/` apply | Deduplicate and upsert the aggregate in one transaction | 3 | Not built |
-| `consumer/` | Poll loop, manual offset commit, shutdown | 3 | Not built |
-| Query API | Read aggregates from PostgreSQL | 3 | Not built |
+| `/health`, `/ready` | Liveness; readiness of the broker, the topic, the producer's poll thread, and the database at the expected migration revision (own readiness engine, each check bounded) | 2, 3 | Built |
+| PostgreSQL in Docker Compose (`make up`) | Local database and the `_test` database for integration tests | 3 | Built |
+| `data/` tables and migrations | `order_aggregates` and `processed_events`; Alembic revision 0001 with CHECKs from the contract (`make db-migrate`) | 3 | Built |
+| `services/` apply (`apply_order_placed`) | Deduplicate by `event_id` and upsert the aggregate in one transaction; a duplicate changes nothing, any database error rolls back both | 3 | Built |
+| `consumer/` (`make consumer`) | Poll loop; offset committed synchronously after the apply transaction; invalid message logged and skipped; any failure stops the process without committing; SIGTERM finishes the current event | 3 | Built |
+| Query API (`GET /stores/{store_id}/aggregates`) | Read a store's aggregates in `[from, to)` from PostgreSQL only; parameters validated with the contract's rules and reason codes | 3 | Built |
 | Late-event policy | Watermark and allowed lateness | 4 | Not built |
 | Restart and rebalance handling | Offset behaviour on restart, commit on partition revoke | 5 | Not built |
 | Dead-letter path and replay | Route poison and late events with a reason code; replay procedure | 6 | Not built |

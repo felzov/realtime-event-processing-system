@@ -9,6 +9,6 @@ the same file.
 | [0001](0001-event-contract.md) | Event contract | Accepted |
 | [0002](0002-broker-and-client-stack.md) | Broker and client stack | Accepted |
 | [0003](0003-ingest-acknowledgement.md) | Ingest acknowledgement | Accepted |
-| 0004 | Offsets and database consistency | Planned (phase 3) |
+| [0004](0004-offsets-and-database.md) | Offsets and database consistency | Accepted |
 | 0005 | Windows and late events | Planned (phase 4) |
 | 0006 | Dead letters and replay | Planned (phase 6) |

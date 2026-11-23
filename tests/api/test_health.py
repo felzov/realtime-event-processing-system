@@ -8,14 +8,16 @@ import httpx
 import pytest
 
 from event_pipeline.config import Settings
-from event_pipeline.main import create_app, create_app_from_settings
-from tests.api.helpers import FakePublisher, error_of, send
+from event_pipeline.main import create_app_from_settings
+from tests.api.helpers import FakePublisher, FakeReadiness, error_of, make_app, send
 
 CAUSE = "UNKNOWN_TOPIC_OR_PART"
+# Appears only in an exception message: never in a response or a log line.
+MARKER = "zz-MARKER"
 
 
 def test_health_answers_200() -> None:
-    response = send(create_app(FakePublisher()), method="GET", path="/health")
+    response = send(make_app(FakePublisher()), method="GET", path="/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
@@ -23,13 +25,17 @@ def test_health_answers_200() -> None:
 
 def test_health_answers_200_while_not_ready() -> None:
     # Liveness must not depend on the broker, or an outage would get a healthy process restarted.
-    response = send(create_app(FakePublisher(unready_cause=CAUSE)), method="GET", path="/health")
+    response = send(
+        make_app(FakePublisher(unready_cause=CAUSE)),
+        method="GET",
+        path="/health",
+    )
 
     assert response.status_code == 200
 
 
 def test_ready_answers_200_when_the_publisher_can_publish() -> None:
-    response = send(create_app(FakePublisher()), method="GET", path="/ready")
+    response = send(make_app(FakePublisher()), method="GET", path="/ready")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
@@ -39,7 +45,11 @@ def test_not_ready_answers_503_and_logs_the_cause_without_returning_it(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING, logger="event_pipeline.api.health"):
-        response = send(create_app(FakePublisher(unready_cause=CAUSE)), method="GET", path="/ready")
+        response = send(
+            make_app(FakePublisher(unready_cause=CAUSE)),
+            method="GET",
+            path="/ready",
+        )
 
     assert response.status_code == 503
     error = error_of(response)
@@ -48,6 +58,83 @@ def test_not_ready_answers_503_and_logs_the_cause_without_returning_it(
     (record,) = caplog.records
     assert record.levelno == logging.WARNING
     assert CAUSE in record.getMessage()
+
+
+def ready_with(
+    publisher: FakePublisher, database: FakeReadiness, caplog: pytest.LogCaptureFixture
+) -> httpx.Response:
+    with caplog.at_level(logging.WARNING, logger="event_pipeline.api.health"):
+        return send(make_app(publisher, database_readiness=database), method="GET", path="/ready")
+
+
+def test_ready_asks_the_database_once_the_publisher_is_ready(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    database = FakeReadiness()
+
+    response = ready_with(FakePublisher(), database, caplog)
+
+    assert response.status_code == 200
+    assert database.calls == 1
+
+
+def test_database_not_ready_answers_503_and_logs_the_cause_without_returning_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    response = ready_with(FakePublisher(), FakeReadiness("migration_mismatch"), caplog)
+
+    assert response.status_code == 503
+    assert error_of(response)["code"] == "not_ready"
+    assert "migration_mismatch" not in response.text
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == "not ready: migration_mismatch"
+
+
+def test_the_database_is_not_asked_while_the_publisher_is_not_ready(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    database = FakeReadiness()
+
+    response = ready_with(FakePublisher(unready_cause=CAUSE), database, caplog)
+
+    assert response.status_code == 503
+    assert database.calls == 0
+    (record,) = caplog.records
+    assert record.getMessage() == f"not ready: {CAUSE}"
+
+
+class _RaisingPublisher(FakePublisher):
+    def unready_cause(self) -> str | None:
+        raise RuntimeError(f"probe failed on {MARKER}")
+
+
+@pytest.mark.parametrize("failing", ["publisher", "database"])
+def test_an_exception_in_either_check_answers_503_not_500(
+    failing: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    raising = RuntimeError(f"probe failed on {MARKER}")
+    publisher = _RaisingPublisher() if failing == "publisher" else FakePublisher()
+    database = FakeReadiness(raises=raising if failing == "database" else None)
+
+    response = ready_with(publisher, database, caplog)
+
+    assert response.status_code == 503
+    assert error_of(response)["code"] == "not_ready"
+    (record,) = caplog.records
+    # A bug in a check, not an outage: ERROR, so alerting does not mistake it for one.
+    assert record.levelno == logging.ERROR
+    assert record.getMessage() == "not ready: unexpected:RuntimeError"
+    assert MARKER not in caplog.text
+    assert MARKER not in response.text
+
+
+def test_health_answers_200_while_the_database_is_not_ready() -> None:
+    app = make_app(database_readiness=FakeReadiness("db_unavailable"))
+
+    response = send(app, method="GET", path="/health")
+
+    assert response.status_code == 200
 
 
 class _SlowProbe(FakePublisher):
@@ -59,7 +146,7 @@ class _SlowProbe(FakePublisher):
 
 
 def test_a_slow_ready_check_does_not_block_other_requests() -> None:
-    app = create_app(_SlowProbe())
+    app = make_app(_SlowProbe())
 
     async def both() -> tuple[float, float]:
         transport = httpx.ASGITransport(app=app)

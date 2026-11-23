@@ -155,8 +155,12 @@ class EventPublisher:
             return CAUSE_POLL_THREAD_DEAD
         try:
             # The producer's own handle is thread-safe, so this can run beside the poll thread.
-            # Asking for one topic keeps the request small; the broker does not create it
-            # (auto-create is off), it answers UNKNOWN_TOPIC_OR_PART.
+            # Asking for one topic keeps the request small. A producer's metadata request may ask
+            # the broker to create a missing topic (librdkafka documents allow.auto.create.topics
+            # as on for producers; not verified for this call), so a missing topic reads as
+            # UNKNOWN_TOPIC_OR_PART because the broker refuses: `auto.create.topics.enable=false`
+            # in compose.yaml (phase 2, D3). With auto-create on, this check could create the topic
+            # with the broker's defaults.
             metadata = self._producer.list_topics(topic=self._topic, timeout=self._ready_timeout_s)
         except KafkaException as exc:
             error: KafkaError = exc.args[0]
