@@ -1,4 +1,4 @@
-"""The consumer against real Kafka and PostgreSQL (phase 3 acceptance criteria 5 and 6).
+"""The consumer against real Kafka and PostgreSQL (phase 3 criteria 5 and 6, phase 5 criterion 2).
 
 Each test has its own topic, consumer group and store ids, so tests never share offsets or rows.
 """
@@ -20,7 +20,7 @@ import pytest
 from confluent_kafka import Consumer, KafkaError, KafkaException, Message, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient
 from pydantic import SecretStr
-from sqlalchemy import Connection, Engine, select, text
+from sqlalchemy import Connection, Engine, event, func, select, text
 from sqlalchemy.exc import DBAPIError
 
 from event_pipeline.broker.config import consumer_config, producer_config
@@ -28,7 +28,7 @@ from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, EventPublisher, 
 from event_pipeline.broker.topics import TopicSpec, ensure_topic
 from event_pipeline.config import Settings
 from event_pipeline.consumer.loop import CommittedPartition, Headers, run
-from event_pipeline.data.tables import order_aggregates
+from event_pipeline.data.tables import order_aggregates, processed_events
 from event_pipeline.domain.events import OrderPlacedEvent
 from event_pipeline.domain.windows import window_start
 from event_pipeline.services.aggregation import ApplyOutcome, apply_order_placed
@@ -91,14 +91,23 @@ def produce(
     *values: bytes,
     key: bytes = b"store",
     received_at: datetime | None = RECEIVED_AT,
+    partition: int | None = None,
 ) -> None:
-    """Produce directly, as the ingest API would: with a received_at header, unless None."""
+    """Produce directly, as the ingest API would: with a received_at header, unless None.
+
+    `partition` overrides the key's partition, for tests that need messages on several.
+    """
     headers: Headers = (
         [] if received_at is None else [(RECEIVED_AT_HEADER, format_received_at(received_at))]
     )
     producer = Producer(producer_config(settings))
     for value in values:
-        producer.produce(settings.events_topic, value=value, key=key, headers=headers)
+        if partition is None:
+            producer.produce(settings.events_topic, value=value, key=key, headers=headers)
+        else:
+            producer.produce(
+                settings.events_topic, value=value, key=key, headers=headers, partition=partition
+            )
     assert producer.flush(TIMEOUT_S) == 0
 
 
@@ -212,10 +221,11 @@ class RunningConsumer:
         settings: Settings,
         engine: Engine,
         wrap: Callable[[Consumer], Any] = lambda consumer: consumer,
+        stop_flag: threading.Event | None = None,
     ) -> None:
         self.consumer = Consumer(consumer_config(settings))
         self.consumer.subscribe([settings.events_topic])
-        self.stop_flag = threading.Event()
+        self.stop_flag = stop_flag or threading.Event()
         self.error: BaseException | None = None
         self.outcomes: list[ApplyOutcome] = []
 
@@ -464,6 +474,185 @@ def test_restart_after_crash_point_b_redelivers_and_changes_nothing(
         ApplyOutcome.APPLIED,
     ]
     assert counts(migrated_engine, store_id) == [("EUR", 3, 600)]
+
+
+# --- Restarts: where a consumer resumes (phase 5) -------------------------------------------------
+
+
+def recorded(engine: Engine, *bodies: dict[str, Any]) -> int:
+    """How many of these events processed_events holds."""
+    ids = [uuid.UUID(body["event_id"]) for body in bodies]
+    query = select(func.count()).where(processed_events.c.event_id.in_(ids))
+    with engine.connect() as connection:
+        return connection.execute(query).scalar_one()
+
+
+class StopAfterMessages:
+    """The real consumer, except that the stop flag is set when the n-th message is polled: the
+    loop finishes that message and stops, while later messages may already sit in the client's
+    prefetch queue, read from the broker but not handled."""
+
+    def __init__(self, consumer: Consumer, n: int, stop: threading.Event) -> None:
+        self.consumer, self.remaining, self.stop = consumer, n, stop
+
+    def poll(self, timeout: float) -> Message | None:
+        message = self.consumer.poll(timeout)
+        if message is not None:
+            self.remaining -= 1
+            if self.remaining == 0:
+                self.stop.set()
+        return message
+
+    def commit(
+        self, *, message: Message, asynchronous: Literal[False]
+    ) -> Sequence[CommittedPartition] | None:
+        return self.consumer.commit(message=message, asynchronous=asynchronous)
+
+
+def test_clean_restart_reads_only_the_messages_after_the_committed_offset(
+    settings: Settings, migrated_engine: Engine, running: list[RunningConsumer]
+) -> None:
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    amounts = (1, 2, 4, 8, 16)
+    produce(
+        settings,
+        *(encode(event_body(store_id, amount_minor=n)) for n in amounts),
+        key=store_id.encode(),
+    )
+
+    # Stopped mid-stream: after the second of five messages.
+    stop = threading.Event()
+    first = RunningConsumer(
+        settings,
+        migrated_engine,
+        wrap=lambda consumer: StopAfterMessages(consumer, 2, stop),
+        stop_flag=stop,
+    )
+    running.append(first)
+    first.thread.join(TIMEOUT_S)
+    first.stop()
+    assert first.error is None
+    assert first.outcomes == [ApplyOutcome.APPLIED] * 2
+    # Only what the loop handled is committed: neither close() nor prefetching commits more.
+    [(partition, offset)] = committed_offsets(settings).items()
+    assert offset == 2
+
+    restarted = RunningConsumer(settings, migrated_engine)
+    running.append(restarted)
+    wait_for(
+        lambda: committed_offsets(settings) == end_offsets(settings),
+        "every offset committed",
+        watching=[restarted],
+    )
+    restarted.stop()
+
+    assert restarted.error is None
+    # Three apply calls: had the restart re-read offsets 0 and 1, they would show up as duplicates.
+    assert restarted.outcomes == [ApplyOutcome.APPLIED] * 3
+    assert committed_offsets(settings) == {partition: len(amounts)}
+    assert counts(migrated_engine, store_id) == [("EUR", len(amounts), sum(amounts))]
+
+
+def fail_next_commit(engine: Engine) -> None:
+    """Make the engine's next COMMIT raise before it is sent to PostgreSQL: crash point A at its
+    latest moment (docs/architecture.md). The event is applied in one transaction, so that is the
+    event's COMMIT; that both of its statements share it is test_aggregation's to prove. A process
+    kill is phase 7; for the database the outcome is the same, the transaction never commits."""
+    fired = False
+
+    def fail(connection: Connection) -> None:
+        nonlocal fired
+        if not fired:
+            fired = True
+            raise SimulatedCrashError
+
+    event.listen(engine, "commit", fail)
+
+
+def test_restart_after_crash_point_a_applies_the_event_exactly_once(
+    settings: Settings, migrated_engine: Engine, running: list[RunningConsumer]
+) -> None:
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    bodies = [event_body(store_id, amount_minor=100 * n) for n in (1, 2, 3)]
+    produce(settings, *(encode(body) for body in bodies), key=store_id.encode())
+
+    fail_next_commit(migrated_engine)
+    crashed = RunningConsumer(settings, migrated_engine)
+    running.append(crashed)
+    crashed.thread.join(TIMEOUT_S)
+    crashed.stop()
+
+    assert crashed.error is not None
+    assert isinstance(crashed.error.__cause__, SimulatedCrashError)
+    assert crashed.outcomes == []  # the first event's apply raised
+    # Nothing of the first event reached either system.
+    assert recorded(migrated_engine, bodies[0]) == 0
+    assert counts(migrated_engine, store_id) == []
+    assert committed_offsets(settings) == {}
+
+    restarted = RunningConsumer(settings, migrated_engine)
+    running.append(restarted)
+    wait_for(
+        lambda: committed_offsets(settings) == end_offsets(settings),
+        "every offset committed",
+        watching=[restarted],
+    )
+    restarted.stop()
+
+    assert restarted.error is None
+    # The first event is redelivered and applied now, once: not a duplicate of anything.
+    assert restarted.outcomes == [ApplyOutcome.APPLIED] * 3
+    assert recorded(migrated_engine, *bodies) == 3
+    assert counts(migrated_engine, store_id) == [("EUR", 3, 600)]
+
+
+def test_a_new_group_rereads_the_topic_and_changes_no_aggregate(
+    settings: Settings, migrated_engine: Engine, running: list[RunningConsumer]
+) -> None:
+    # Store n on partition n - 1, with n messages: every partition holds a different count.
+    stores = [f"store-{uuid.uuid4().hex[:8]}" for _ in range(PARTITIONS)]
+    for n, store_id in enumerate(stores, start=1):
+        produce(
+            settings,
+            *(encode(event_body(store_id, amount_minor=10 * n)) for _ in range(n)),
+            key=store_id.encode(),
+            partition=n - 1,
+        )
+    log_end = {n - 1: n for n in range(1, PARTITIONS + 1)}
+    assert end_offsets(settings) == log_end
+    total = sum(log_end.values())
+
+    first = RunningConsumer(settings, migrated_engine)
+    running.append(first)
+    wait_for(
+        lambda: committed_offsets(settings) == log_end,
+        "every offset committed",
+        watching=[first],
+    )
+    first.stop()
+    assert first.error is None
+    assert first.outcomes == [ApplyOutcome.APPLIED] * total
+    before = {store_id: counts(migrated_engine, store_id) for store_id in stores}
+    assert before == {
+        store_id: [("EUR", n, 10 * n * n)] for n, store_id in enumerate(stores, start=1)
+    }
+
+    # A new group has no committed offsets, so it starts from the beginning (earliest).
+    replay_settings = settings.model_copy(update={"consumer_group_id": f"test.{uuid.uuid4().hex}"})
+    replay = RunningConsumer(replay_settings, migrated_engine)
+    running.append(replay)
+    wait_for(
+        lambda: committed_offsets(replay_settings) == log_end,
+        "every offset committed by the new group",
+        watching=[replay],
+    )
+    replay.stop()
+
+    assert replay.error is None
+    assert replay.outcomes == [ApplyOutcome.DUPLICATE] * total
+    assert {store_id: counts(migrated_engine, store_id) for store_id in stores} == before
+    # Each group keeps its own offsets: the replay did not move the first group's.
+    assert committed_offsets(settings) == log_end
 
 
 # --- A database failure stops the consumer -------------------------------------------------------
