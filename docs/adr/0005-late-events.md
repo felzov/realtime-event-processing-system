@@ -63,6 +63,11 @@ defaults are assumptions.
   "Everything received before it" is approximate: `received_at` is set before the event is
   produced, so concurrent requests can land in a partition slightly out of `received_at` order.
   Nothing in the API reports a window as final yet.
+- **A replay can only add.** Under decision 7 a replay into the same database counts the events
+  that now pass and skips the rest. Raising the limits and replaying therefore counts events that
+  were skipped before, but lowering them never removes events already counted: the aggregates are
+  incremental, and nothing recomputes a window. Applying a stricter policy to the past would need
+  the windows rebuilt from the topic.
 - **Our own lag does not count.** A consumer that is stopped for an hour and then catches up still
   counts every event that reached ingest in time. Only the producer-to-ingest delay counts.
 - **A late retry is reported as late, not as a duplicate.** A retry gets a new `received_at`. If
