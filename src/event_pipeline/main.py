@@ -23,8 +23,9 @@ from event_pipeline.api import aggregates, events, health
 from event_pipeline.api.dependencies import ReadinessProbe
 from event_pipeline.api.errors import register_error_handlers
 from event_pipeline.broker.publisher import EventPublisher
-from event_pipeline.config import DEFAULT_QUERY_MAX_RANGE_S, Settings
+from event_pipeline.config import DEFAULT_LATENESS, DEFAULT_QUERY_MAX_RANGE_S, Settings
 from event_pipeline.data.engine import make_engine, make_readiness_engine
+from event_pipeline.domain.lateness import LatenessPolicy
 from event_pipeline.services.ingest import Publisher
 from event_pipeline.services.readiness import DatabaseReadiness
 
@@ -41,12 +42,14 @@ def create_app(
     engine: Engine,
     database_readiness: ReadinessProbe,
     query_max_range: timedelta = timedelta(seconds=DEFAULT_QUERY_MAX_RANGE_S),
+    lateness: LatenessPolicy = DEFAULT_LATENESS,
 ) -> FastAPI:
     app = _new_app(lifespan=None)
     app.state.publisher = publisher
     app.state.engine = engine
     app.state.database_readiness = database_readiness
     app.state.query_max_range = query_max_range
+    app.state.lateness = lateness
     return app
 
 
@@ -68,6 +71,7 @@ def create_app_from_settings(settings: Settings | None = None) -> FastAPI:
         publisher = EventPublisher.from_settings(resolved)
         app.state.publisher = publisher
         app.state.query_max_range = timedelta(seconds=resolved.query_max_range_s)
+        app.state.lateness = resolved.lateness_policy()
         try:
             yield
         finally:

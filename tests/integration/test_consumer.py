@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,12 +24,13 @@ from sqlalchemy import Connection, Engine, select, text
 from sqlalchemy.exc import DBAPIError
 
 from event_pipeline.broker.config import consumer_config, producer_config
-from event_pipeline.broker.publisher import EventPublisher
+from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, EventPublisher, format_received_at
 from event_pipeline.broker.topics import TopicSpec, ensure_topic
 from event_pipeline.config import Settings
-from event_pipeline.consumer.loop import CommittedPartition, run
+from event_pipeline.consumer.loop import CommittedPartition, Headers, run
 from event_pipeline.data.tables import order_aggregates
 from event_pipeline.domain.events import OrderPlacedEvent
+from event_pipeline.domain.windows import window_start
 from event_pipeline.services.aggregation import ApplyOutcome, apply_order_placed
 from tests.api.helpers import make_app
 from tests.integration.test_ingest_api import post_event
@@ -41,6 +42,9 @@ POLL_TIMEOUT_S = 0.2
 CLOSE_TIMEOUT_S = 10.0
 PAYLOAD_MARKER = "ord-PAYLOAD-MARKER"
 WINDOW = datetime(2026, 11, 22, 12, 30, tzinfo=UTC)
+# The received_at header of messages produced directly: 30 s after event_body's default
+# occurred_at, so on time (ADR 0005). Fixed, so these tests do not depend on the clock.
+RECEIVED_AT = WINDOW + timedelta(seconds=45)
 
 
 @pytest.fixture
@@ -78,10 +82,23 @@ def event_body(
     return body
 
 
-def produce(settings: Settings, *values: bytes, key: bytes = b"store") -> None:
+def rfc3339(instant: datetime) -> str:
+    return instant.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def produce(
+    settings: Settings,
+    *values: bytes,
+    key: bytes = b"store",
+    received_at: datetime | None = RECEIVED_AT,
+) -> None:
+    """Produce directly, as the ingest API would: with a received_at header, unless None."""
+    headers: Headers = (
+        [] if received_at is None else [(RECEIVED_AT_HEADER, format_received_at(received_at))]
+    )
     producer = Producer(producer_config(settings))
     for value in values:
-        producer.produce(settings.events_topic, value=value, key=key)
+        producer.produce(settings.events_topic, value=value, key=key, headers=headers)
     assert producer.flush(TIMEOUT_S) == 0
 
 
@@ -214,6 +231,7 @@ class RunningConsumer:
                     apply,
                     stop=self.stop_flag,
                     poll_timeout_s=settings.consumer_poll_timeout_s,
+                    lateness=settings.lateness_policy(),
                 )
             except BaseException as exc:  # read by the test after join
                 self.error = exc
@@ -248,12 +266,19 @@ def test_events_posted_to_the_api_end_up_in_the_aggregates_once(
     settings: Settings, migrated_engine: Engine, running: list[RunningConsumer]
 ) -> None:
     store_a, store_b = f"store-{uuid.uuid4().hex[:8]}", f"store-{uuid.uuid4().hex[:8]}"
-    retried = event_body(store_a, amount_minor=1000)
+    # The API stamps received_at with the current time, so the events must be recent to count
+    # (ADR 0005): two windows that ended a minute or two ago.
+    earlier = window_start(datetime.now(UTC)) - timedelta(minutes=2)
+    first, second = (
+        rfc3339(earlier + timedelta(seconds=15)),
+        rfc3339(earlier + timedelta(minutes=1)),
+    )
+    retried = event_body(store_a, amount_minor=1000, occurred_at=first)
     bodies = [
         retried,
-        event_body(store_a, amount_minor=250),
-        event_body(store_a, amount_minor=99, occurred_at="2026-11-22T12:31:00Z"),
-        event_body(store_b, amount_minor=500),
+        event_body(store_a, amount_minor=250, occurred_at=first),
+        event_body(store_a, amount_minor=99, occurred_at=second),
+        event_body(store_b, amount_minor=500, occurred_at=first),
         retried,  # a client retry: the same event_id, a second message on the topic
     ]
     publisher = EventPublisher.from_settings(settings)
@@ -310,6 +335,71 @@ def test_invalid_message_is_skipped_and_its_offset_committed(
     [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert "invalid_json" in warning.getMessage()
     assert PAYLOAD_MARKER not in caplog.text
+
+
+# --- Late, future and unreadable received_at (ADR 0005) -----------------------------------------
+
+
+def test_events_that_do_not_count_are_skipped_without_blocking_and_replay_the_same(
+    settings: Settings,
+    migrated_engine: Engine,
+    running: list[RunningConsumer],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    key = store_id.encode()
+    occurred = WINDOW + timedelta(seconds=15)  # event_body's default occurred_at
+    # One partition (same key), in this order: on time, late, from the future, no header, on time.
+    produce(settings, encode(event_body(store_id, amount_minor=1)), key=key)
+    late = event_body(store_id, amount_minor=10)
+    produce(settings, encode(late), key=key, received_at=occurred + timedelta(minutes=10))
+    future = event_body(store_id, amount_minor=100)
+    produce(settings, encode(future), key=key, received_at=occurred - timedelta(minutes=2))
+    unstamped = event_body(store_id, amount_minor=1000)
+    produce(settings, encode(unstamped), key=key, received_at=None)
+    produce(settings, encode(event_body(store_id, amount_minor=10_000)), key=key)
+
+    with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+        first = RunningConsumer(settings, migrated_engine)
+        running.append(first)
+        wait_for(
+            lambda: committed_offsets(settings) == end_offsets(settings),
+            "every offset committed",
+            watching=[first],
+        )
+        first.stop()
+
+    assert first.error is None
+    assert counts(migrated_engine, store_id) == [("EUR", 2, 10_001)]
+    assert [o.value for o in first.outcomes] == ["applied", "applied"]
+    skipped = [r.getMessage() for r in caplog.records if " skipped at " in r.getMessage()]
+    # The key decides the partition; all five messages share it.
+    partition = skipped[0].split(" partition ")[1].split()[0]
+    assert skipped == [
+        f"event {late['event_id']} skipped at partition {partition} offset 1: "
+        "late_event, received 600.000 s after occurred_at",
+        f"event {future['event_id']} skipped at partition {partition} offset 2: "
+        "future_event, received 120.000 s before occurred_at",
+        f"event {unstamped['event_id']} skipped at partition {partition} offset 3: "
+        "invalid_received_at",
+    ]
+    assert PAYLOAD_MARKER not in caplog.text
+
+    # A replay (a new group reads the topic from the start) classifies every message the same way:
+    # the two on-time events are duplicates now, and the other three are skipped again.
+    replay_settings = settings.model_copy(update={"consumer_group_id": f"test.{uuid.uuid4().hex}"})
+    replay = RunningConsumer(replay_settings, migrated_engine)
+    running.append(replay)
+    wait_for(
+        lambda: committed_offsets(replay_settings) == end_offsets(replay_settings),
+        "every offset committed again",
+        watching=[replay],
+    )
+    replay.stop()
+
+    assert replay.error is None
+    assert counts(migrated_engine, store_id) == [("EUR", 2, 10_001)]
+    assert [o.value for o in replay.outcomes] == ["duplicate", "duplicate"]
 
 
 # --- Crash point B: database committed, offset not ------------------------------------------------

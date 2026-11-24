@@ -5,6 +5,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,18 +14,33 @@ from confluent_kafka import KafkaError, KafkaException
 from sqlalchemy.exc import IntegrityError
 
 import event_pipeline
+from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, format_received_at
 from event_pipeline.consumer.loop import (
     ConsumerFailedError,
+    Headers,
     OffsetCommitError,
     describe_error,
     raised_at,
     run,
 )
 from event_pipeline.domain.events import OrderPlacedEvent
+from event_pipeline.domain.lateness import LatenessPolicy
 from event_pipeline.services.aggregation import ApplyOutcome
 from tests.samples import EVENT_ID, STORE_ID, encode, valid_event
 
 POLL_TIMEOUT_S = 0.01
+LATENESS = LatenessPolicy(
+    allowed_lateness=timedelta(minutes=5), max_future_skew=timedelta(minutes=1)
+)
+# The sample event's occurred_at (tests/samples.py) and a received_at ten seconds later: on time.
+OCCURRED_AT = datetime(2026, 11, 18, 10, 0, 30, tzinfo=UTC)
+RECEIVED_ON_TIME = OCCURRED_AT + timedelta(seconds=10)
+
+
+def received_at_headers(received_at: datetime) -> list[tuple[str, str | bytes | None]]:
+    return [(RECEIVED_AT_HEADER, format_received_at(received_at))]
+
+
 # Appears only in the payload of the test events: no log line may contain it.
 PAYLOAD_MARKER = "ord-PAYLOAD-MARKER"
 
@@ -41,6 +57,7 @@ class FakeMessage:
     offset_: int
     partition_: int = 2
     error_: KafkaError | None = None
+    headers_: Headers | None = field(default_factory=lambda: received_at_headers(RECEIVED_ON_TIME))
 
     def error(self) -> KafkaError | None:
         return self.error_
@@ -53,6 +70,9 @@ class FakeMessage:
 
     def offset(self) -> int | None:
         return self.offset_
+
+    def headers(self) -> Headers | None:
+        return self.headers_
 
 
 @dataclass
@@ -106,7 +126,13 @@ class Harness:
         return self.apply_result(event)
 
     def run(self) -> None:
-        run(self.consumer, self.apply, stop=self.stop, poll_timeout_s=POLL_TIMEOUT_S)
+        run(
+            self.consumer,
+            self.apply,
+            stop=self.stop,
+            poll_timeout_s=POLL_TIMEOUT_S,
+            lateness=LATENESS,
+        )
 
 
 # --- Normal path ---------------------------------------------------------------------------------
@@ -168,6 +194,126 @@ def test_invalid_message_is_logged_and_committed_without_touching_the_database(
     assert reason in record.getMessage()
     assert PAYLOAD_MARKER not in caplog.text
     assert "euro" not in caplog.text
+
+
+# --- Late, future and unreadable received_at (ADR 0005) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("headers", "reason"),
+    [
+        (
+            received_at_headers(OCCURRED_AT + timedelta(minutes=5, microseconds=1)),
+            "late_event, received 300.000 s after occurred_at",
+        ),
+        (
+            received_at_headers(OCCURRED_AT + timedelta(days=2)),
+            "late_event, received 172800.000 s after occurred_at",
+        ),
+        (
+            received_at_headers(OCCURRED_AT - timedelta(minutes=1, microseconds=1)),
+            "future_event, received 60.000 s before occurred_at",
+        ),
+        (None, "invalid_received_at"),
+        ([], "invalid_received_at"),
+        ([("other", b"x")], "invalid_received_at"),
+        ([(RECEIVED_AT_HEADER, None)], "invalid_received_at"),
+        ([(RECEIVED_AT_HEADER, b"2026-11-18T10:00:40Z")], "invalid_received_at"),
+        (
+            [(RECEIVED_AT_HEADER, format_received_at(RECEIVED_ON_TIME).decode())],
+            "invalid_received_at",
+        ),
+        (received_at_headers(RECEIVED_ON_TIME) * 2, "invalid_received_at"),
+    ],
+    ids=[
+        "late_by_a_microsecond",
+        "days_late",
+        "from_the_future",
+        "no_headers",
+        "empty_headers",
+        "other_header_only",
+        "header_without_value",
+        "malformed",
+        "str_value",
+        "repeated",
+    ],
+)
+def test_an_event_that_does_not_count_is_logged_and_committed_without_the_database(
+    headers: Headers | None, reason: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=7, partition_=5, headers_=headers))
+
+    with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+        harness.run()
+
+    assert harness.calls == [("commit", 7)]
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == f"event {EVENT_ID} skipped at partition 5 offset 7: {reason}"
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "received_at",
+    [
+        OCCURRED_AT + timedelta(minutes=5),
+        OCCURRED_AT - timedelta(minutes=1),
+        OCCURRED_AT,
+    ],
+    ids=["exactly_the_allowed_lateness", "exactly_the_allowed_skew", "same_instant"],
+)
+def test_an_event_on_time_at_the_bounds_is_applied(received_at: datetime) -> None:
+    harness = Harness(
+        FakeMessage(event_bytes(), offset_=3, headers_=received_at_headers(received_at))
+    )
+
+    harness.run()
+
+    assert harness.calls == [("apply", None), ("commit", 3)]
+
+
+def test_a_bug_reading_the_headers_stops_the_loop_instead_of_skipping(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A header item that is not a (name, value) pair is not bad input but a broken client or bug:
+    # skipping would silently drop every event, so the loop fails without committing.
+    malformed: Any = [(RECEIVED_AT_HEADER, b"x", "extra")]
+    harness = Harness(FakeMessage(event_bytes(), offset_=7, headers_=malformed))
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConsumerFailedError):
+        harness.run()
+
+    assert harness.calls == []
+    assert "skipped" not in caplog.text
+
+
+def test_headers_as_a_dict_are_read_too() -> None:
+    # confluent-kafka types headers as a list or a dict; a consumed message has a list.
+    headers: Headers = {RECEIVED_AT_HEADER: format_received_at(RECEIVED_ON_TIME)}
+    harness = Harness(FakeMessage(event_bytes(), offset_=3, headers_=headers))
+
+    harness.run()
+
+    assert harness.calls == [("apply", None), ("commit", 3)]
+
+
+def test_a_skipped_event_does_not_hold_up_the_next() -> None:
+    late = received_at_headers(OCCURRED_AT + timedelta(hours=1))
+    harness = Harness(
+        FakeMessage(event_bytes(), offset_=1),
+        FakeMessage(event_bytes(), offset_=2, headers_=late),
+        FakeMessage(event_bytes(), offset_=3),
+    )
+
+    harness.run()
+
+    assert harness.calls == [
+        ("apply", None),
+        ("commit", 1),
+        ("commit", 2),
+        ("apply", None),
+        ("commit", 3),
+    ]
 
 
 # --- Failures: no commit, the loop raises --------------------------------------------------------

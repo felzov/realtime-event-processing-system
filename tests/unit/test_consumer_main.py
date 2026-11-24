@@ -3,12 +3,16 @@
 import logging
 import os
 import threading
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
 
 import pytest
 from confluent_kafka import KafkaError
 
 from event_pipeline.consumer import __main__ as consumer_main
 from event_pipeline.consumer.__main__ import EXIT_CLOSE_TIMEOUT, CloseWatchdog, log_client_error
+from event_pipeline.domain.lateness import LatenessPolicy
 
 
 def test_watchdog_exits_even_when_logging_is_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -80,3 +84,33 @@ def test_arm_and_cancel_survive_a_signal_handler_arming_in_the_middle(
 
     assert not main_thread.is_alive(), "arm() or cancel() deadlocked on its own lock"
     watchdog.cancel()
+
+
+class _StubConsumer:
+    def __init__(self, config: dict[str, Any]) -> None: ...
+    def subscribe(self, topics: list[str]) -> None: ...
+    def close(self) -> None: ...
+
+
+class _StubEngine:
+    def dispose(self) -> None: ...
+
+
+def test_main_runs_the_loop_with_the_configured_lateness_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Not the defaults (300 / 60): a hard-coded or default policy would not match.
+    monkeypatch.chdir(tmp_path)  # no .env
+    monkeypatch.setenv("ALLOWED_LATENESS_S", "17")
+    monkeypatch.setenv("MAX_FUTURE_SKEW_S", "3")
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(consumer_main, "Consumer", _StubConsumer)
+    monkeypatch.setattr(consumer_main, "make_engine", lambda settings: _StubEngine())
+    # No signal handlers installed in the pytest process.
+    monkeypatch.setattr(consumer_main, "_stop_on_signals", lambda stop, watchdog: None)
+    monkeypatch.setattr(consumer_main, "run", lambda *args, **kwargs: seen.update(kwargs))
+
+    assert consumer_main.main() == 0
+    assert seen["lateness"] == LatenessPolicy(
+        allowed_lateness=timedelta(seconds=17), max_future_skew=timedelta(seconds=3)
+    )

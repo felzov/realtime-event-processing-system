@@ -5,7 +5,10 @@ For each message:
 1. A broker error delivered as a message stops the loop (decision 6).
 2. A value that is not a valid event is logged with its reason codes, partition and offset, never
    its content, and its offset is committed (decision 7, interim until the dead-letter path).
-3. A valid event is applied in one database transaction; then its offset + 1 is committed
+3. A valid event whose `received_at` header is missing or malformed, or that is late or from the
+   future (ADR 0005), is logged with its reason code, event id, partition and offset, never its
+   content, and its offset is committed without touching the database (ADR 0005, decisions 3-5).
+4. Any other valid event is applied in one database transaction; then its offset + 1 is committed
    synchronously (decisions 1 and 3). A duplicate is committed the same way.
 
 Any error from polling, applying or committing ends the loop without committing that message's
@@ -29,12 +32,18 @@ from uuid import UUID
 from confluent_kafka import KafkaError, KafkaException
 from sqlalchemy.exc import DBAPIError
 
+from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, parse_received_at
 from event_pipeline.data.errors import describe_database_error
-from event_pipeline.domain.errors import EventRejectedError
+from event_pipeline.domain.errors import EventRejectedError, ReasonCode
 from event_pipeline.domain.events import OrderPlacedEvent, parse_event
+from event_pipeline.domain.lateness import LatenessPolicy, Timing, classify
 from event_pipeline.services.aggregation import ApplyOutcome
 
 logger = logging.getLogger(__name__)
+
+# What confluent-kafka's `Message.headers()` returns (its `HeadersType`, which is private).
+type HeaderValue = str | bytes | None
+type Headers = dict[str, HeaderValue] | list[tuple[str, HeaderValue]]
 
 
 class Message(Protocol):
@@ -44,6 +53,7 @@ class Message(Protocol):
     def value(self) -> bytes | None: ...
     def partition(self) -> int | None: ...
     def offset(self) -> int | None: ...
+    def headers(self) -> Headers | None: ...
 
 
 class CommittedPartition(Protocol):
@@ -88,6 +98,7 @@ def run[M: Message](
     *,
     stop: threading.Event,
     poll_timeout_s: float,
+    lateness: LatenessPolicy,
 ) -> None:
     """Process messages until `stop` is set.
 
@@ -101,7 +112,7 @@ def run[M: Message](
             if message is None:
                 continue
             position.partition, position.offset = message.partition(), message.offset()
-            _process(consumer, apply, message, position)
+            _process(consumer, apply, lateness, message, position)
         except Exception as exc:
             # No exc_info: the traceback would print str(exc), which for a database error carries
             # the event's values (PostgreSQL's DETAIL repeats the failing row).
@@ -120,6 +131,7 @@ def run[M: Message](
 def _process[M: Message](
     consumer: MessageSource[M],
     apply: Callable[[OrderPlacedEvent], ApplyOutcome],
+    lateness: LatenessPolicy,
     message: M,
     position: _Position,
 ) -> None:
@@ -138,16 +150,61 @@ def _process[M: Message](
         )
     else:
         position.event_id = event.event_id
-        outcome = apply(event)
-        logger.debug(
-            "event %s %s at partition %s offset %s",
-            event.event_id,
-            outcome.value,
-            message.partition(),
-            message.offset(),
-        )
+        skipped = _not_counted_because(event, message.headers(), lateness)
+        if skipped is not None:
+            logger.warning(
+                "event %s skipped at partition %s offset %s: %s",
+                event.event_id,
+                message.partition(),
+                message.offset(),
+                skipped,
+            )
+        else:
+            outcome = apply(event)
+            logger.debug(
+                "event %s %s at partition %s offset %s",
+                event.event_id,
+                outcome.value,
+                message.partition(),
+                message.offset(),
+            )
 
     _commit(consumer, message)
+
+
+def _not_counted_because(
+    event: OrderPlacedEvent, headers: Headers | None, lateness: LatenessPolicy
+) -> str | None:
+    """None if `event` counts; otherwise its reason code and, for timing, by how much (ADR 0005)."""
+    value = received_at_header(headers)
+    try:
+        received_at = parse_received_at(value)
+    except ValueError:
+        # Only the header's value is bad input. An error while finding it (headers shaped other
+        # than confluent-kafka documents) is a bug: it stops the loop like any other.
+        return ReasonCode.INVALID_RECEIVED_AT.value
+    timing = classify(event.occurred_at, received_at, lateness)
+    delay_s = (received_at - event.occurred_at).total_seconds()
+    if timing is Timing.LATE:
+        return f"{ReasonCode.LATE_EVENT.value}, received {delay_s:.3f} s after occurred_at"
+    if timing is Timing.FUTURE:
+        return f"{ReasonCode.FUTURE_EVENT.value}, received {-delay_s:.3f} s before occurred_at"
+    return None
+
+
+def received_at_header(headers: Headers | None) -> bytes | None:
+    """The value of the one `received_at` header; None if there is none, or more than one.
+
+    Kafka allows a header name to repeat. Which copy would count is not defined, so two copies are
+    treated like none (ADR 0005, decision 5). A value that is not bytes is not the API's either.
+    """
+    if headers is None:
+        return None
+    pairs = headers.items() if isinstance(headers, dict) else headers
+    values = [value for name, value in pairs if name == RECEIVED_AT_HEADER]
+    if len(values) != 1 or not isinstance(values[0], bytes):
+        return None
+    return values[0]
 
 
 def _commit[M: Message](consumer: MessageSource[M], message: M) -> None:

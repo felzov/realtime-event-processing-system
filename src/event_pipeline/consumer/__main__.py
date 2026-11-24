@@ -118,7 +118,13 @@ def main() -> int:
         def apply(event: OrderPlacedEvent) -> ApplyOutcome:
             return apply_order_placed(engine, event)
 
-        run(consumer, apply, stop=stop, poll_timeout_s=settings.consumer_poll_timeout_s)
+        run(
+            consumer,
+            apply,
+            stop=stop,
+            poll_timeout_s=settings.consumer_poll_timeout_s,
+            lateness=settings.lateness_policy(),
+        )
     except ConsumerFailedError:
         status = EXIT_FAILED  # the loop logged it
     except Exception as exc:

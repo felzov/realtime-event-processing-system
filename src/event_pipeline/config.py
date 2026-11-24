@@ -4,12 +4,15 @@ All limits and timeouts are explicit here. The defaults are placeholders for a l
 setup, not measured values.
 """
 
+from datetime import timedelta
 from typing import Self
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
+
+from event_pipeline.domain.lateness import LatenessPolicy
 
 # librdkafka checks message timeouts about once a second, so `_MSG_TIMED_OUT` can arrive up to about
 # a second after `delivery.timeout.ms` (5.6 s for 5000 ms in the ADR 0002 spike); waiting for the
@@ -23,6 +26,14 @@ DATABASE_DRIVER = "postgresql+psycopg"
 
 # 24 h; also the default of `create_app`, which the tests call without settings.
 DEFAULT_QUERY_MAX_RANGE_S = 86_400
+
+# The late-event policy's defaults (ADR 0005), shared with `create_app` like the one above.
+DEFAULT_ALLOWED_LATENESS_S = 300.0
+DEFAULT_MAX_FUTURE_SKEW_S = 60.0
+DEFAULT_LATENESS = LatenessPolicy(
+    allowed_lateness=timedelta(seconds=DEFAULT_ALLOWED_LATENESS_S),
+    max_future_skew=timedelta(seconds=DEFAULT_MAX_FUTURE_SKEW_S),
+)
 
 # Statements one applied event can run: the pool's pre-ping, the processed_events insert, the
 # aggregate upsert and COMMIT (services/aggregation.py).
@@ -74,6 +85,12 @@ class Settings(BaseSettings):
     # response: one per minute window and currency, so 1440 windows per currency by default.
     query_max_range_s: int = Field(default=DEFAULT_QUERY_MAX_RANGE_S, gt=0)
 
+    # The late-event policy (ADR 0005). An event that reached ingest more than ALLOWED_LATENESS_S
+    # after its occurred_at, or claims an occurred_at more than MAX_FUTURE_SKEW_S after it reached
+    # ingest, changes no aggregate. Both defaults are assumptions, not measured delays.
+    allowed_lateness_s: float = Field(default=DEFAULT_ALLOWED_LATENESS_S, gt=0)
+    max_future_skew_s: float = Field(default=DEFAULT_MAX_FUTURE_SKEW_S, ge=0)
+
     # The default is the local Compose database (compose.yaml); its password is a fixed development
     # value, not a secret. A SecretStr keeps the URL, password included, out of reprs and logs.
     database_url: SecretStr = SecretStr(
@@ -102,6 +119,13 @@ class Settings(BaseSettings):
     # From a stop request to the process exiting: finishing the current event, leaving the group.
     # Past it the process exits anyway, with an error status (consumer/__main__.py).
     consumer_close_timeout_s: float = Field(default=10.0, gt=0)
+
+    def lateness_policy(self) -> LatenessPolicy:
+        """The late-event policy for the consumer and the ingest API (ADR 0005)."""
+        return LatenessPolicy(
+            allowed_lateness=timedelta(seconds=self.allowed_lateness_s),
+            max_future_skew=timedelta(seconds=self.max_future_skew_s),
+        )
 
     @field_validator("database_url")
     @classmethod
@@ -144,6 +168,17 @@ class Settings(BaseSettings):
                 "worst-case database time of one event (pool + connect timeouts + "
                 f"{DB_STATEMENTS_PER_EVENT} x db_statement_timeout_ms)"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _lateness_settings_make_a_policy(self) -> Self:
+        # Each field can be valid while the policy is not: inf or a huge value overflows
+        # timedelta, and a value below a microsecond rounds to zero. Refused here, at load, rather
+        # than when the consumer or the API first builds the policy.
+        try:
+            self.lateness_policy()
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"allowed_lateness_s / max_future_skew_s: {exc}") from None
         return self
 
     @model_validator(mode="after")

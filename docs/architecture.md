@@ -1,7 +1,8 @@
 # Architecture
 
-This is the **target** design. Only the ingest side is built so far; the
-[component table](#components) says which phase builds each part. Decisions are recorded in [ADRs](adr/README.md).
+This is the **target** design. Ingest, the consumer, the aggregates, the query API and the
+late-event policy are built (phases 1–4); the [component table](#components) says which phase
+builds each part. Decisions are recorded in [ADRs](adr/README.md).
 
 The broker is Apache Kafka 4.3.2 in KRaft mode, used through `confluent-kafka`; the consumer and
 the database access are synchronous ([ADR 0002](adr/0002-broker-and-client-stack.md)).
@@ -40,8 +41,19 @@ flowchart LR
 - **A poison event does not block its partition.** It goes to the dead-letter path with a reason
   code, and the offset moves on (ADR 0006).
 
-None of these is demonstrated yet. Each one becomes a claim only when the phase that builds it has
-a test proving it.
+Each becomes a claim only when a test proves it. So far:
+
+- At-least-once with deduplication, and the offset following the database: demonstrated against
+  real Kafka and PostgreSQL in phase 3 (`tests/integration/test_aggregation.py`,
+  `tests/integration/test_consumer.py`, including a redelivery after crash point B). Restarts and
+  rebalances with several consumers are phase 5.
+- Ingest reporting only what it observed: phase 2 (`tests/api/test_events.py`,
+  `tests/integration/test_ingest_api.py`).
+- Event time decides the window, and late or future events do not count: phases 1 and 4
+  (`tests/unit/test_windows.py`, `tests/unit/test_lateness.py`, the consumer tests).
+- Poison events: only partly. Invalid, late and future messages are skipped and their offset moves
+  on; an event the database rejects permanently still stops the consumer until the dead-letter
+  path (phase 6).
 
 ## Consume, apply, commit
 
@@ -57,6 +69,8 @@ sequenceDiagram
     C->>K: poll
     K-->>C: event (partition p, offset n)
     C->>C: validate envelope and payload
+    C->>C: classify by received_at (ADR 0005)
+    Note over C: late, future or no valid received_at: log, skip the database, commit offset n + 1
     C->>DB: BEGIN
     C->>DB: INSERT processed_events (event_id) ON CONFLICT DO NOTHING
     alt inserted (first time)
@@ -85,8 +99,8 @@ The same reasoning applies at ingest. If the API crashes after the broker acknow
 but before it answered the client, the client retries with the same `event_id`, the topic holds
 the event twice, and deduplication in the consumer absorbs it.
 
-The diagram shows one offset commit per event. Whether offsets are committed per event or per
-batch, and what happens on a rebalance, is decided in ADR 0004 and tested in phase 5.
+The diagram shows one offset commit per event, synchronous, as ADR 0004 decided. What happens to
+an uncommitted event when its partition moves to another consumer (a rebalance) is phase 5.
 
 ## Components
 
@@ -105,7 +119,7 @@ business rules.
 | `services/` apply (`apply_order_placed`) | Deduplicate by `event_id` and upsert the aggregate in one transaction; a duplicate changes nothing, any database error rolls back both | 3 | Built |
 | `consumer/` (`make consumer`) | Poll loop; offset committed synchronously after the apply transaction; invalid message logged and skipped; any failure stops the process without committing; SIGTERM finishes the current event | 3 | Built |
 | Query API (`GET /stores/{store_id}/aggregates`) | Read a store's aggregates in `[from, to)` from PostgreSQL only; parameters validated with the contract's rules and reason codes | 3 | Built |
-| Late-event policy | Watermark and allowed lateness | 4 | Not built |
+| Late-event policy (`domain/lateness.py`) | An event counts only if `received_at − occurred_at` ≤ `ALLOWED_LATENESS_S`; the consumer skips late, future and unstamped events (logged, offset committed); ingest rejects events from the future (ADR 0005) | 4 | Built |
 | Restart and rebalance handling | Offset behaviour on restart, commit on partition revoke | 5 | Not built |
 | Dead-letter path and replay | Route poison and late events with a reason code; replay procedure | 6 | Not built |
 | Failure tests | Process kill, database down, broker down | 7 | Not built |

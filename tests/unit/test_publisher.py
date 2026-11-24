@@ -34,6 +34,7 @@ from event_pipeline.broker.publisher import (
     classify,
     format_received_at,
     log_client_error,
+    parse_received_at,
 )
 from event_pipeline.config import Settings
 
@@ -72,6 +73,61 @@ def test_received_at_with_another_offset_is_converted_to_utc() -> None:
 def test_naive_received_at_is_refused() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         format_received_at(datetime(2026, 11, 19, 15, 36, 33))
+
+
+@pytest.mark.parametrize(
+    "received_at",
+    [
+        datetime(2026, 11, 19, 15, 36, 33, 191_000, tzinfo=UTC),
+        datetime(2026, 11, 19, 15, 36, 33, tzinfo=UTC),
+        datetime(2026, 1, 2, 3, 4, 5, 6, tzinfo=UTC),
+    ],
+    ids=["milliseconds", "whole_second", "single_digit_fields"],
+)
+def test_received_at_round_trips(received_at: datetime) -> None:
+    assert parse_received_at(format_received_at(received_at)) == received_at
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        b"",
+        b"garbage",
+        "2026-11-19T15:36:33.191000Z".encode("utf-16"),
+        b"2026-11-19T15:36:33.191000\xc3\xa9",
+        b"2026-11-19T15:36:33.191000",
+        b"2026-11-19T15:36:33.191000+00:00",
+        b"2026-11-19T15:36:33Z",
+        b"2026-11-19T15:36:33.191Z",
+        b"2026-1-19T15:36:33.191000Z",
+        b"2026-11-19 15:36:33.191000Z",
+        b"2026-11-19T15:36:33.191000z",
+        b" 2026-11-19T15:36:33.191000Z",
+        b"2026-13-19T15:36:33.191000Z",
+        b"1795390127",
+    ],
+    ids=[
+        "missing",
+        "empty",
+        "garbage",
+        "utf16",
+        "non_ascii",
+        "naive",
+        "numeric_offset",
+        "no_fraction",
+        "short_fraction",
+        "one_digit_month",
+        "space_separator",
+        "lowercase_z",
+        "leading_space",
+        "month_13",
+        "unix_seconds",
+    ],
+)
+def test_received_at_in_any_other_form_is_refused(value: bytes | None) -> None:
+    with pytest.raises(ValueError):
+        parse_received_at(value)
 
 
 def test_successful_report_becomes_delivered() -> None:

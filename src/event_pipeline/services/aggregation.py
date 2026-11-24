@@ -9,8 +9,9 @@ The text of a propagated error can still contain the event's values: the engine 
 parameters, but PostgreSQL's own DETAIL for a constraint violation repeats the failing row. Log the
 exception class and SQLSTATE, never `str(exc)`.
 
-The window comes from the event's own `occurred_at` (event time). Every valid event is applied,
-however late: the late-event policy is phase 4 (ADR 0005).
+The window comes from the event's own `occurred_at` (event time). Whether an event counts at all
+is decided before this is called: the consumer skips late and future events (ADR 0005), so every
+event that reaches this function is applied.
 """
 
 from enum import Enum
