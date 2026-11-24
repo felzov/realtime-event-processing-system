@@ -2,7 +2,10 @@
 
 ADR 0003: the value on the topic is the client's raw body, unchanged; the key is `store_id`;
 `received_at` travels as a header and is set here, never taken from the client (ADR 0001,
-decision 4). Success means the broker acknowledged the write; anything else raises.
+decision 4). An event whose `occurred_at` is too far after `received_at` is rejected: the client's
+clock is wrong, and the consumer would skip it anyway (ADR 0005, decision 6). A late event is still
+accepted: the topic keeps it. Success means the broker acknowledged the write; anything else
+raises.
 """
 
 import logging
@@ -11,7 +14,9 @@ from typing import Protocol, assert_never
 from uuid import UUID
 
 from event_pipeline.broker.publisher import Delivered, Delivery, NotDelivered, PublishFailure
+from event_pipeline.domain.errors import EventRejectedError, ReasonCode, Violation
 from event_pipeline.domain.events import parse_event
+from event_pipeline.domain.lateness import LatenessPolicy, Timing, classify
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +36,7 @@ class EventNotConfirmedError(Exception):
         self.cause = outcome.cause
 
 
-async def ingest_event(raw: bytes, publisher: Publisher) -> UUID:
+async def ingest_event(raw: bytes, publisher: Publisher, lateness: LatenessPolicy) -> UUID:
     """Publish `raw` if it is a valid event and return its `event_id` once the broker acknowledged.
 
     Raises `EventRejectedError` (nothing is published) or `EventNotConfirmedError`.
@@ -39,6 +44,8 @@ async def ingest_event(raw: bytes, publisher: Publisher) -> UUID:
     # Before parsing, so it is as close to receipt as possible; a rejected event discards it.
     received_at = datetime.now(UTC)
     event = parse_event(raw)
+    if classify(event.occurred_at, received_at, lateness) is Timing.FUTURE:
+        raise EventRejectedError((Violation(ReasonCode.OUT_OF_RANGE, "occurred_at"),))
 
     outcome = await publisher.publish(
         key=event.payload.store_id, value=raw, received_at=received_at

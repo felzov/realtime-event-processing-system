@@ -8,6 +8,7 @@ from sqlalchemy import Engine
 
 from event_pipeline.api.errors import BodyTooLargeError
 from event_pipeline.domain.events import MAX_BODY_BYTES
+from event_pipeline.domain.lateness import LatenessPolicy
 from event_pipeline.services.ingest import Publisher
 
 
@@ -41,6 +42,11 @@ def _database_readiness(request: Request) -> ReadinessProbe:
 def _engine(request: Request) -> Engine:
     engine: Engine = request.app.state.engine
     return engine
+
+
+def _lateness(request: Request) -> LatenessPolicy:
+    lateness: LatenessPolicy = request.app.state.lateness
+    return lateness
 
 
 def _query_max_range(request: Request) -> timedelta:
@@ -85,3 +91,4 @@ AppDatabaseReadiness = Annotated[ReadinessProbe, Depends(_database_readiness)]
 CappedBody = Annotated[bytes, Depends(_capped_body)]
 AppEngine = Annotated[Engine, Depends(_engine)]
 QueryMaxRange = Annotated[timedelta, Depends(_query_max_range)]
+AppLateness = Annotated[LatenessPolicy, Depends(_lateness)]

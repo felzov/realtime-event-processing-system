@@ -27,6 +27,14 @@ DATABASE_DRIVER = "postgresql+psycopg"
 # 24 h; also the default of `create_app`, which the tests call without settings.
 DEFAULT_QUERY_MAX_RANGE_S = 86_400
 
+# The late-event policy's defaults (ADR 0005), shared with `create_app` like the one above.
+DEFAULT_ALLOWED_LATENESS_S = 300.0
+DEFAULT_MAX_FUTURE_SKEW_S = 60.0
+DEFAULT_LATENESS = LatenessPolicy(
+    allowed_lateness=timedelta(seconds=DEFAULT_ALLOWED_LATENESS_S),
+    max_future_skew=timedelta(seconds=DEFAULT_MAX_FUTURE_SKEW_S),
+)
+
 # Statements one applied event can run: the pool's pre-ping, the processed_events insert, the
 # aggregate upsert and COMMIT (services/aggregation.py).
 DB_STATEMENTS_PER_EVENT = 4
@@ -80,8 +88,8 @@ class Settings(BaseSettings):
     # The late-event policy (ADR 0005). An event that reached ingest more than ALLOWED_LATENESS_S
     # after its occurred_at, or claims an occurred_at more than MAX_FUTURE_SKEW_S after it reached
     # ingest, changes no aggregate. Both defaults are assumptions, not measured delays.
-    allowed_lateness_s: float = Field(default=300.0, gt=0)
-    max_future_skew_s: float = Field(default=60.0, ge=0)
+    allowed_lateness_s: float = Field(default=DEFAULT_ALLOWED_LATENESS_S, gt=0)
+    max_future_skew_s: float = Field(default=DEFAULT_MAX_FUTURE_SKEW_S, ge=0)
 
     # The default is the local Compose database (compose.yaml); its password is a fixed development
     # value, not a secret. A SecretStr keeps the URL, password included, out of reprs and logs.

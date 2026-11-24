@@ -8,15 +8,20 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 
+import httpx
 import pytest
+from pydantic import SecretStr
 from starlette.types import Message, Scope
 
 from event_pipeline.broker.publisher import Delivery, NotDelivered, PublishFailure
+from event_pipeline.config import Settings
 from event_pipeline.domain.events import MAX_BODY_BYTES
-from tests.api.helpers import FakePublisher, error_of, make_app, send
+from event_pipeline.domain.lateness import LatenessPolicy
+from event_pipeline.main import create_app_from_settings
+from tests.api.helpers import NO_DATABASE_URL, FakePublisher, error_of, make_app, send
 from tests.samples import EVENT_ID, STORE_ID, encode, valid_event
 
 # Distinctive text placed in rejected input; no response may contain it.
@@ -127,6 +132,121 @@ def test_rejection_never_echoes_input() -> None:
         "invalid_format",
         "unknown_field",
     }
+
+
+# --- 422 for an event from the future; a late event is accepted (ADR 0005, decision 6) ----------
+
+
+def event_occurring_at(occurred_at: datetime, offset: timedelta = timedelta(0)) -> bytes:
+    """The sample event with `occurred_at` written in the UTC offset `offset`."""
+    body = valid_event()
+    body["occurred_at"] = occurred_at.astimezone(timezone(offset)).isoformat()
+    return encode(body)
+
+
+REJECTED_FROM_THE_FUTURE = {
+    "error": {
+        "code": "event_rejected",
+        "message": "the event does not satisfy the contract",
+        "violations": [{"path": "occurred_at", "code": "out_of_range"}],
+    }
+}
+
+
+def test_an_event_from_the_future_is_422_and_not_published() -> None:
+    publisher = FakePublisher()
+    tomorrow = datetime.now(UTC) + timedelta(days=1)
+
+    response = send(make_app(publisher), content=event_occurring_at(tomorrow))
+
+    assert response.status_code == 422
+    # The whole body: a fixed envelope, so no form of the submitted time can be echoed.
+    assert response.json() == REJECTED_FROM_THE_FUTURE
+    assert publisher.calls == []
+
+
+@pytest.mark.parametrize(
+    ("ahead", "offset", "status"),
+    [
+        (timedelta(0), timedelta(hours=14), 202),
+        (timedelta(hours=2), timedelta(hours=-12), 422),
+    ],
+    ids=["now_written_in_plus_14", "two_hours_ahead_written_in_minus_12"],
+)
+def test_occurred_at_is_compared_as_an_instant_whatever_its_offset(
+    ahead: timedelta, offset: timedelta, status: int
+) -> None:
+    # In -12:00, an instant two hours ahead reads as a wall-clock time ten hours behind UTC.
+    publisher = FakePublisher()
+
+    response = send(
+        make_app(publisher), content=event_occurring_at(datetime.now(UTC) + ahead, offset)
+    )
+
+    assert response.status_code == status
+    assert len(publisher.calls) == (1 if status == 202 else 0)
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [timedelta(seconds=30), timedelta(0), -timedelta(days=30)],
+    ids=["slightly_ahead_within_the_skew", "now", "a_month_late"],
+)
+def test_an_event_within_the_skew_or_late_is_accepted(offset: timedelta) -> None:
+    # Late events are accepted: the topic keeps them, and the consumer skips them (ADR 0005).
+    publisher = FakePublisher()
+
+    response = send(make_app(publisher), content=event_occurring_at(datetime.now(UTC) + offset))
+
+    assert response.status_code == 202
+    assert len(publisher.calls) == 1
+
+
+def test_the_skew_comes_from_create_app() -> None:
+    strict = LatenessPolicy(allowed_lateness=timedelta(minutes=5), max_future_skew=timedelta(0))
+    publisher = FakePublisher()
+    soon = datetime.now(UTC) + timedelta(seconds=30)
+
+    response = send(make_app(publisher, lateness=strict), content=event_occurring_at(soon))
+
+    assert response.status_code == 422
+    assert publisher.calls == []
+
+
+@pytest.mark.parametrize(
+    ("max_future_skew_s", "status", "code"),
+    [(0, 422, "event_rejected"), (3600, 503, "broker_unavailable")],
+    ids=["no_skew_rejects", "an_hour_of_skew_passes_to_the_unreachable_broker"],
+)
+def test_the_app_from_settings_uses_the_configured_skew(
+    max_future_skew_s: int, status: int, code: str
+) -> None:
+    # Nothing listens on the broker port: an event that passes the check is not confirmed (503),
+    # one that fails it is rejected before publishing (422).
+    settings = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        kafka_bootstrap_servers="127.0.0.1:1",
+        kafka_delivery_timeout_ms=500,
+        publish_backstop_s=3.0,
+        publisher_close_timeout_s=0.5,
+        database_url=SecretStr(NO_DATABASE_URL),
+        max_future_skew_s=max_future_skew_s,
+    )
+    application = create_app_from_settings(settings)
+    raw = event_occurring_at(datetime.now(UTC) + timedelta(minutes=30))
+
+    async def scenario() -> httpx.Response:
+        async with application.router.lifespan_context(application):
+            transport = httpx.ASGITransport(app=application)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.post("/events", content=raw)
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == status
+    assert error_of(response)["code"] == code
+    if status == 422:
+        assert response.json() == REJECTED_FROM_THE_FUTURE
 
 
 # --- 413: the body is over the cap, refused before parsing ---------------------------------------
