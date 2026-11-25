@@ -84,7 +84,9 @@ decision 3 does.
 | Committing for a partition that was already revoked and given to the other consumer (every 100 ms for 12 s, counted by owner) | **Succeeded**: 30 times while the first consumer owned it, 59 times while the other one did, once between the two steps when no member owned it; 1 `ILLEGAL_GENERATION`. The classic protocol does not check which member owns a partition on commit |
 | After exceeding `max.poll.interval.ms` (consumer evicted), alone or with a second member | **Raised** `KafkaException(UNKNOWN_MEMBER_ID)`, not fatal, not retriable. The next `poll` returned an error message `_MAX_POLL_EXCEEDED` (not fatal), `on_lost` was called, and the poll after that rejoined the group |
 
-`REBALANCE_IN_PROGRESS` did not occur. With callbacks that only log, `confluent-kafka` applied
+`REBALANCE_IN_PROGRESS` did not occur in the spike; it did later, in real runs of the two-consumer
+test of slice 3 (`tests/integration/test_rebalance.py`), next to `ILLEGAL_GENERATION`. With
+callbacks that only log, `confluent-kafka` applied
 each assignment itself, after the callback returned. Each rebalance took two steps: the moving
 partitions were revoked first, then assigned to the other consumer in a second rebalance a few
 seconds later.
@@ -134,6 +136,12 @@ leaves behind, every message before that position has been handled. If the posit
 what the new owner has reached, messages are redelivered, which decision 2 absorbs; no message
 is ever skipped. Ownership of a partition is therefore not what keeps the aggregate correct; the
 `event_id` primary key is.
+
+Consequence of decision 10: a refused commit is not retried. The partition's committed offset
+stays behind until the next message on it is committed, or until a restart or a new owner
+redelivers from it. A group that keeps rebalancing can keep offsets behind for a long time; the
+aggregates stay correct, a restart redelivers more, and it shows only as repeated WARNINGs. An alert
+after a number of refusals in a row was considered and left out until there is a need for it.
 
 Alternatives for this update: the default eager strategy (every rebalance stops every partition;
 correct, but it pauses all partitions for every join and leave); the new consumer group protocol

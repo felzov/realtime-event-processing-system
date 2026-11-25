@@ -23,7 +23,7 @@ built:
   ([ADR 0005](docs/adr/0005-late-events.md)).
 - `GET /stores/{store_id}/aggregates` reads the aggregates from PostgreSQL.
 
-Rebalances, the dead-letter path and failure tests come in later phases; the
+The dead-letter path and failure tests come in later phases; the
 [component table](docs/architecture.md#components) has the build order. This is a learning project,
 not a production service.
 
@@ -126,8 +126,8 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
 
 - No authentication or rate limiting, and the broker and database connections are plaintext:
   local use only.
-- One API process holds one producer; running several is untested. One consumer process has been
-  tested; several in one group are untested until phase 5.
+- One API process holds one producer; running several is untested. Two consumers in one group
+  have been tested (one joining and one leaving while events arrive); larger groups have not.
 - `/ready` does not detect a fatal producer error (ADR 0003, limitations), and an outage logs one
   warning per probe. A database outage takes ingest out of rotation too: one process serves both.
 - The database's timeouts are enforced by PostgreSQL: a server that stops answering after
@@ -155,8 +155,17 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
   consumer each time it is redelivered, which blocks its partition until the dead-letter path
   (phase 6). An invalid message on the topic is logged and skipped: it is lost apart from the log
   line.
-- A commit that lands during a consumer group rebalance stops the consumer (status `1`; nothing is
-  lost or counted twice); committing on partition revoke is phase 5.
+- An offset commit refused because the group's membership changed (a rebalance or an eviction:
+  `ILLEGAL_GENERATION`, `UNKNOWN_MEMBER_ID`, `REBALANCE_IN_PROGRESS`) is logged as a WARNING and the
+  consumer goes on; the event may be redelivered and is then counted as a duplicate (ADR 0004,
+  decision 10). Exceeding `CONSUMER_MAX_POLL_INTERVAL_MS` still stops the consumer (status `1`).
+  Such a refusal is not retried: the partition's offset stays behind until its next message is
+  committed, or until a restart redelivers from it. A group that keeps rebalancing can keep offsets
+  behind for long (the aggregates stay correct, restarts redeliver more), and shows it only as
+  repeated WARNINGs.
+- Every consumer of a group must use the same assignment strategy (`cooperative-sticky` since
+  phase 5): stop consumers started from an older version before starting this one, or it stops
+  with `INCONSISTENT_GROUP_PROTOCOL`.
 - Stopping the consumer during an event slower than `CONSUMER_CLOSE_TIMEOUT_S` ends with status `2`
   and that event rolled back; it is redelivered on restart.
 - `processed_events` grows by one row per event and is never pruned yet.
