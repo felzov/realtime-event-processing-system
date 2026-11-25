@@ -1,4 +1,5 @@
-"""`apply_order_placed` against the real test database (phase 3 acceptance criteria 2 and 3).
+"""`apply_order_placed` against the real test database (phase 3 criteria 2 and 3, phase 5
+criterion 5).
 
 Every test uses its own store_id and fresh event_ids, so tests never see each other's rows and
 nothing needs deleting.
@@ -22,6 +23,7 @@ from event_pipeline.data.aggregates import add_order_to_aggregate, record_proces
 from event_pipeline.data.engine import make_engine
 from event_pipeline.data.tables import order_aggregates, processed_events
 from event_pipeline.domain.events import OrderPlacedEvent, OrderPlacedV1, parse_event
+from event_pipeline.domain.fingerprint import fingerprint
 from event_pipeline.services import aggregation
 from event_pipeline.services.aggregation import ApplyOutcome, apply_order_placed
 from tests.samples import encode, valid_event
@@ -68,6 +70,13 @@ def counts(engine: Engine, store_id: str) -> list[tuple[datetime, str, int, int]
     ]
 
 
+def stored_fingerprint(engine: Engine, event_id: uuid.UUID) -> bytes | None:
+    query = select(processed_events.c.body_sha256).where(processed_events.c.event_id == event_id)
+    with engine.connect() as connection:
+        value: bytes | None = connection.execute(query).scalar_one()
+        return value
+
+
 def is_recorded(engine: Engine, event_id: uuid.UUID) -> bool:
     query = select(processed_events.c.event_id).where(processed_events.c.event_id == event_id)
     with engine.connect() as connection:
@@ -89,7 +98,7 @@ def test_first_event_creates_its_window_row(
     assert apply_order_placed(migrated_engine, event) is ApplyOutcome.APPLIED
 
     assert counts(migrated_engine, store_id) == [(WINDOW, "EUR", 1, 2599)]
-    assert is_recorded(migrated_engine, event.event_id)
+    assert stored_fingerprint(migrated_engine, event.event_id) == fingerprint(event)
 
 
 def test_second_event_in_the_same_window_adds_to_the_row(
@@ -152,20 +161,57 @@ def test_same_event_again_is_a_duplicate_and_changes_nothing(
     assert aggregates(migrated_engine, store_id) == before
 
 
-def test_same_event_id_with_another_body_is_a_duplicate(
+def test_same_event_id_with_another_body_is_a_conflicting_duplicate_and_changes_nothing(
     migrated_engine: Engine, make_event: Callable[..., OrderPlacedEvent], store_id: str
 ) -> None:
-    # ADR 0004, consequences: the event_id is the identity; detecting a changed body is phase 5.
+    # ADR 0004, decision 13: detected, not counted; the first copy stays.
     event_id = uuid.uuid4()
-    apply_order_placed(migrated_engine, make_event(event_id=event_id, amount_minor=100))
+    first = make_event(event_id=event_id, amount_minor=100)
+    apply_order_placed(migrated_engine, first)
+    assert counts(migrated_engine, store_id) == [(WINDOW, "EUR", 1, 100)]
+    before = aggregates(migrated_engine, store_id)
 
     outcome = apply_order_placed(
         migrated_engine,
         make_event(event_id=event_id, occurred_at="2026-11-22T12:31:00Z", amount_minor=999),
     )
 
+    assert outcome is ApplyOutcome.CONFLICTING_DUPLICATE
+    assert aggregates(migrated_engine, store_id) == before
+    assert stored_fingerprint(migrated_engine, event_id) == fingerprint(first)
+
+
+def test_same_event_written_with_another_utc_offset_is_a_plain_duplicate(
+    migrated_engine: Engine, make_event: Callable[..., OrderPlacedEvent], store_id: str
+) -> None:
+    # The same instant, the same values: only the spelling of occurred_at differs.
+    event_id = uuid.uuid4()
+    apply_order_placed(
+        migrated_engine, make_event(event_id=event_id, occurred_at="2026-11-22T12:30:15Z")
+    )
+
+    outcome = apply_order_placed(
+        migrated_engine,
+        make_event(event_id=event_id, occurred_at="2026-11-22T15:30:15.000+03:00"),
+    )
+
     assert outcome is ApplyOutcome.DUPLICATE
-    assert counts(migrated_engine, store_id) == [(WINDOW, "EUR", 1, 100)]
+    assert counts(migrated_engine, store_id) == [(WINDOW, "EUR", 1, 2599)]
+
+
+def test_an_event_recorded_before_fingerprints_is_a_plain_duplicate_whatever_its_body(
+    migrated_engine: Engine, make_event: Callable[..., OrderPlacedEvent], store_id: str
+) -> None:
+    # A row from before revision 0002 has no fingerprint: nothing to compare with.
+    event_id = uuid.uuid4()
+    with migrated_engine.begin() as connection:
+        connection.execute(processed_events.insert().values(event_id=event_id))
+
+    outcome = apply_order_placed(migrated_engine, make_event(event_id=event_id, amount_minor=999))
+
+    assert outcome is ApplyOutcome.DUPLICATE
+    assert counts(migrated_engine, store_id) == []
+    assert stored_fingerprint(migrated_engine, event_id) is None  # not backfilled
 
 
 def apply_in_thread(
@@ -257,7 +303,7 @@ def first_delivery_of(event: OrderPlacedEvent) -> Callable[[Connection], None]:
     """The two statements of a delivery of `event`, for a transaction caught mid-apply."""
 
     def statements(connection: Connection) -> None:
-        assert record_processed_event(connection, event.event_id)
+        assert record_processed_event(connection, event.event_id, fingerprint(event))
         add_order_to_aggregate(
             connection,
             store_id=event.payload.store_id,
@@ -281,6 +327,40 @@ def test_concurrent_delivery_waits_and_is_a_duplicate_once_the_first_commits(
 
     assert outcome is ApplyOutcome.DUPLICATE
     assert counts(migrated_engine, store_id) == [(WINDOW, "EUR", 1, 2599)]
+
+
+def test_concurrent_copy_with_another_body_is_a_conflict_once_the_first_commits(
+    migrated_engine: Engine, make_event: Callable[..., OrderPlacedEvent], store_id: str
+) -> None:
+    # The waiting insert conflicts, and the fingerprint it then reads is the committed one.
+    event_id = uuid.uuid4()
+    first = make_event(event_id=event_id, amount_minor=2599)
+    second = make_event(event_id=event_id, amount_minor=1)
+
+    outcome = apply_while_first_is_open(
+        migrated_engine, first_delivery_of(first), second, first_commits=True
+    )
+
+    assert outcome is ApplyOutcome.CONFLICTING_DUPLICATE
+    assert counts(migrated_engine, store_id) == [(WINDOW, "EUR", 1, 2599)]
+    assert stored_fingerprint(migrated_engine, event_id) == fingerprint(first)
+
+
+def test_concurrent_copy_with_another_body_is_applied_if_the_first_rolls_back(
+    migrated_engine: Engine, make_event: Callable[..., OrderPlacedEvent], store_id: str
+) -> None:
+    # Nothing of the first copy was committed, so the second is the first applied copy.
+    event_id = uuid.uuid4()
+    first = make_event(event_id=event_id, amount_minor=2599)
+    second = make_event(event_id=event_id, amount_minor=1)
+
+    outcome = apply_while_first_is_open(
+        migrated_engine, first_delivery_of(first), second, first_commits=False
+    )
+
+    assert outcome is ApplyOutcome.APPLIED
+    assert counts(migrated_engine, store_id) == [(WINDOW, "EUR", 1, 1)]
+    assert stored_fingerprint(migrated_engine, event_id) == fingerprint(second)
 
 
 def test_concurrent_delivery_applies_the_event_if_the_first_rolls_back(

@@ -349,6 +349,46 @@ def test_invalid_message_is_skipped_and_its_offset_committed(
     assert PAYLOAD_MARKER not in caplog.text
 
 
+def test_a_reused_event_id_with_other_content_is_logged_and_not_counted(
+    settings: Settings,
+    migrated_engine: Engine,
+    running: list[RunningConsumer],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    first = event_body(store_id, amount_minor=700)
+    reused = event_body(store_id, amount_minor=9, event_id=first["event_id"])
+    partition_key = store_id.encode()
+    produce(settings, encode(first), encode(reused), key=partition_key)
+    # The same content again, as a client retry through the API would arrive: stamped later.
+    # received_at is not part of the event, so this is a plain duplicate.
+    retried_at = RECEIVED_AT + timedelta(seconds=5)
+    produce(settings, encode(first), key=partition_key, received_at=retried_at)
+
+    with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+        consumer = RunningConsumer(settings, migrated_engine)
+        running.append(consumer)
+        wait_for(
+            lambda: committed_offsets(settings) == end_offsets(settings),
+            "every offset committed",
+            watching=[consumer],
+        )
+        consumer.stop()
+
+    assert consumer.error is None
+    assert consumer.outcomes == [
+        ApplyOutcome.APPLIED,
+        ApplyOutcome.CONFLICTING_DUPLICATE,
+        ApplyOutcome.DUPLICATE,
+    ]
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 700)]
+    [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning.startswith(f"event {first['event_id']} skipped at partition ")
+    assert " offset 1: conflicting_duplicate," in warning
+    assert PAYLOAD_MARKER not in caplog.text
+    assert store_id not in caplog.text
+
+
 # --- Late, future and unreadable received_at (ADR 0005) -----------------------------------------
 
 

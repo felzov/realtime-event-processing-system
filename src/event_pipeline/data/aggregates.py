@@ -1,6 +1,6 @@
 """The statements on the aggregate tables.
 
-The two statements of the apply transaction (ADR 0004, decision 2) and the query API's select.
+The statements of the apply transaction (ADR 0004, decisions 2 and 13) and the query API's select.
 Each takes a `Connection` that is already in a transaction and neither commits nor rolls back:
 `services/` owns the transaction, so both apply statements commit or neither does.
 """
@@ -15,8 +15,10 @@ from sqlalchemy.dialects.postgresql import insert
 from event_pipeline.data.tables import order_aggregates, processed_events
 
 
-def record_processed_event(connection: Connection, event_id: UUID) -> bool:
-    """Insert `event_id` into processed_events; True if it was new, False if already recorded.
+def record_processed_event(connection: Connection, event_id: UUID, body_sha256: bytes) -> bool:
+    """Insert `event_id` with its fingerprint; True if it was new, False if already recorded.
+
+    On a conflict the stored row is left as it is: the first applied copy's fingerprint stays.
 
     If another transaction has inserted the same id and not yet committed, this waits for it on
     the primary key: its commit makes this a conflict (False), its rollback makes this the first
@@ -26,11 +28,22 @@ def record_processed_event(connection: Connection, event_id: UUID) -> bool:
     """
     statement = (
         insert(processed_events)
-        .values(event_id=event_id)
+        .values(event_id=event_id, body_sha256=body_sha256)
         .on_conflict_do_nothing(index_elements=[processed_events.c.event_id])
         .returning(processed_events.c.event_id)
     )
     return connection.execute(statement).first() is not None
+
+
+def recorded_fingerprint(connection: Connection, event_id: UUID) -> bytes | None:
+    """The fingerprint stored with an already recorded `event_id`; None for a row recorded before
+    revision 0002. A new statement, so at READ COMMITTED it sees the row whose commit made
+    `record_processed_event` return False."""
+    statement = select(processed_events.c.body_sha256).where(
+        processed_events.c.event_id == event_id
+    )
+    stored: bytes | None = connection.execute(statement).scalar_one()
+    return stored
 
 
 def add_order_to_aggregate(

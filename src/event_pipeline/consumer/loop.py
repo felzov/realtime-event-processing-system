@@ -9,7 +9,9 @@ For each message:
    future (ADR 0005), is logged with its reason code, event id, partition and offset, never its
    content, and its offset is committed without touching the database (ADR 0005, decisions 3-5).
 4. Any other valid event is applied in one database transaction; then its offset + 1 is committed
-   synchronously (decisions 1 and 3). A duplicate is committed the same way.
+   synchronously (decisions 1 and 3). A duplicate is committed the same way; a conflicting
+   duplicate (its event_id already counted with different content, decision 13) is also logged,
+   with its event id, partition and offset, never its content.
 
 A commit refused because the consumer's group membership changed under it (a rebalance, or an
 eviction) is logged at WARNING and the loop carries on (decision 10): the event's effect is already
@@ -29,7 +31,7 @@ import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, assert_never
 from uuid import UUID
 
 from confluent_kafka import KafkaError, KafkaException
@@ -176,6 +178,22 @@ def _process[M: Message](
             )
         else:
             outcome = apply(event)
+            # Exhaustive: a new ApplyOutcome fails type-checking here until the loop handles it,
+            # so no outcome can be committed past without a decision on how it is reported.
+            match outcome:
+                case ApplyOutcome.APPLIED | ApplyOutcome.DUPLICATE:
+                    pass
+                case ApplyOutcome.CONFLICTING_DUPLICATE:
+                    logger.warning(
+                        "event %s skipped at partition %s offset %s: %s, its event_id was already "
+                        "counted with different content",
+                        event.event_id,
+                        message.partition(),
+                        message.offset(),
+                        ReasonCode.CONFLICTING_DUPLICATE.value,
+                    )
+                case _:
+                    assert_never(outcome)
             logger.debug(
                 "event %s %s at partition %s offset %s",
                 event.event_id,

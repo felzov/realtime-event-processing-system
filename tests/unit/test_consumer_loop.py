@@ -166,6 +166,28 @@ def test_a_duplicate_is_committed_like_an_applied_event() -> None:
     assert harness.calls == [("apply", None), ("commit", 1), ("apply", None), ("commit", 2)]
 
 
+def test_a_conflicting_duplicate_is_logged_without_values_and_committed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
+    outcomes = iter([ApplyOutcome.CONFLICTING_DUPLICATE, ApplyOutcome.APPLIED])
+    harness.apply_result = lambda event: next(outcomes)
+
+    with caplog.at_level(logging.WARNING):
+        harness.run()
+
+    # Committed like any duplicate; the next message is handled as usual.
+    assert harness.calls == [("apply", None), ("commit", 5), ("apply", None), ("commit", 6)]
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"event {EVENT_ID} skipped at partition 2 offset 5: conflicting_duplicate, its event_id "
+        "was already counted with different content"
+    )
+    assert PAYLOAD_MARKER not in caplog.text
+    assert STORE_ID not in caplog.text
+
+
 def test_empty_polls_keep_the_loop_going_until_stopped() -> None:
     harness = Harness(None, None, FakeMessage(event_bytes(), offset_=7), None)
 
