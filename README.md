@@ -63,7 +63,7 @@ is created only when the data volume is new (`docker/postgres-init/`). The passw
 The schema comes from hand-written Alembic migrations in `migrations/`, each with a working
 downgrade. `make db-migrate` applies them to the database in `DATABASE_URL`; the integration tests
 migrate the test database themselves, down to an empty schema and back up. A new migration starts
-from `make db-revision ID=0003 NAME="what it does"`, and `EXPECTED_REVISION` in
+from `make db-revision ID=0004 NAME="what it does"`, and `EXPECTED_REVISION` in
 `src/event_pipeline/data/tables.py` must name the new head (a unit test checks it).
 
 After pulling a change that adds a migration, run `make db-migrate` before starting the API or the

@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 
 from event_pipeline.data.tables import (
     EXPECTED_REVISION,
+    dead_letters,
     metadata,
     order_aggregates,
     processed_events,
@@ -28,7 +29,7 @@ from event_pipeline.domain.windows import window_start
 from tests.migration_helpers import ALEMBIC_INI, migrate
 from tests.samples import encode, valid_event
 
-APP_TABLES = {"processed_events", "order_aggregates"}
+APP_TABLES = {"processed_events", "order_aggregates", "dead_letters"}
 WINDOW = datetime(2026, 11, 22, 12, 30, tzinfo=UTC)
 
 
@@ -97,7 +98,9 @@ def test_migrated_schema_matches_the_table_definitions(migrated_engine: Engine) 
     assert differences == []
 
 
-@pytest.mark.parametrize("table", [processed_events, order_aggregates], ids=lambda t: t.name)
+@pytest.mark.parametrize(
+    "table", [processed_events, order_aggregates, dead_letters], ids=lambda t: t.name
+)
 def test_primary_keys_match_the_table_definitions(migrated_engine: Engine, table: Table) -> None:
     key = inspect(migrated_engine).get_pk_constraint(table.name)
 
@@ -337,3 +340,71 @@ def test_a_fingerprint_must_be_32_bytes(connection: Connection, length: int) -> 
 
 def test_a_row_without_a_fingerprint_is_accepted(connection: Connection) -> None:
     connection.execute(processed_events.insert().values(event_id=uuid.uuid4(), body_sha256=None))
+
+
+# --- Revision 0003: dead_letters (ADR 0006) ------------------------------------------------------
+
+
+def dead_letter_row(**overrides: Any) -> dict[str, Any]:
+    row = {
+        "source_topic": f"migration-test-{uuid.uuid4().hex[:8]}",
+        "source_partition": 0,
+        "source_offset": 0,
+        "message_value": b"{}",
+        "reason_code": "invalid_event",
+    }
+    return {**row, **overrides}
+
+
+def insert_dead_letter(connection: Connection, **overrides: Any) -> None:
+    with connection.begin_nested():
+        connection.execute(dead_letters.insert().values(dead_letter_row(**overrides)))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "constraint"),
+    [
+        ({"reason_code": "unknown_reason"}, "ck_dead_letters_reason_code"),
+        ({"reason_code": "Late_Event"}, "ck_dead_letters_reason_code"),
+        ({"source_partition": -1}, "ck_dead_letters_source_partition"),
+        ({"source_offset": -1}, "ck_dead_letters_source_offset"),
+    ],
+    ids=["unknown-reason", "reason-case", "negative-partition", "negative-offset"],
+)
+def test_dead_letter_checks_reject_invalid_rows(
+    connection: Connection, overrides: dict[str, Any], constraint: str
+) -> None:
+    with pytest.raises(IntegrityError) as exc_info:
+        insert_dead_letter(connection, **overrides)
+
+    assert isinstance(exc_info.value.orig, errors.CheckViolation)
+    assert exc_info.value.orig.diag.constraint_name == constraint
+
+
+def test_a_position_is_one_dead_letter(connection: Connection) -> None:
+    row = dead_letter_row()
+    insert_dead_letter(connection, **row)
+
+    with pytest.raises(IntegrityError) as exc_info:
+        insert_dead_letter(connection, **{**row, "reason_code": "late_event"})
+
+    assert isinstance(exc_info.value.orig, errors.UniqueViolation)
+    assert exc_info.value.orig.diag.constraint_name == "pk_dead_letters"
+
+
+def test_revision_0003_down_drops_only_dead_letters(db_engine: Engine) -> None:
+    migrate(db_engine, "down", "base")
+    migrate(db_engine, "up", "0003")
+    event_id = uuid.uuid4()
+    with db_engine.begin() as connection:
+        connection.execute(processed_events.insert().values(event_id=event_id, body_sha256=None))
+        connection.execute(dead_letters.insert().values(dead_letter_row()))
+
+    migrate(db_engine, "down", "0002")
+
+    assert "dead_letters" not in table_names(db_engine)
+    assert processed_rows(db_engine) == {event_id: None}
+
+    migrate(db_engine, "up", "head")
+    with db_engine.connect() as connection:
+        assert connection.execute(dead_letters.select()).first() is None

@@ -125,7 +125,7 @@ business rules.
 | `broker/` producer, ingest API (`POST /events`) | Validate, produce with `acks=all`, answer after the broker acknowledged | 2 | Built |
 | `/health`, `/ready` | Liveness; readiness of the broker, the topic, the producer's poll thread, and the database at the expected migration revision (own readiness engine, each check bounded) | 2, 3 | Built |
 | PostgreSQL in Docker Compose (`make up`) | Local database and the `_test` database for integration tests | 3 | Built |
-| `data/` tables and migrations | `order_aggregates` and `processed_events`; Alembic revision 0001 with CHECKs from the contract, 0002 adds each event's fingerprint (`make db-migrate`) | 3, 5 | Built |
+| `data/` tables and migrations | `order_aggregates` and `processed_events`; Alembic revision 0001 with CHECKs from the contract, 0002 adds each event's fingerprint, 0003 the `dead_letters` table, not written to yet (`make db-migrate`) | 3, 5, 6 | Built |
 | `services/` apply (`apply_order_placed`) | Deduplicate by `event_id` and upsert the aggregate in one transaction; a duplicate changes nothing, one with a different fingerprint is reported as a conflicting duplicate; any database error rolls back both | 3, 5 | Built |
 | `consumer/` (`make consumer`) | Poll loop; offset committed synchronously after the apply transaction; invalid message logged and skipped; any other failure stops the process without committing; SIGTERM finishes the current event | 3 | Built |
 | Query API (`GET /stores/{store_id}/aggregates`) | Read a store's aggregates in `[from, to)` from PostgreSQL only; parameters validated with the contract's rules and reason codes | 3 | Built |

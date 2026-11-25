@@ -67,8 +67,8 @@ consumer:
 db-migrate:
 > uv run --locked alembic upgrade head
 
-# A new, empty migration to write by hand, e.g. `make db-revision ID=0002 NAME="add an index"`.
+# A new, empty migration to write by hand, e.g. `make db-revision ID=0004 NAME="add an index"`.
 # Then update EXPECTED_REVISION in src/event_pipeline/data/tables.py.
 db-revision:
-> @test -n "$(ID)" && test -n "$(NAME)" || { echo 'usage: make db-revision ID=0002 NAME="what it does"' >&2; exit 2; }
+> @test -n "$(ID)" && test -n "$(NAME)" || { echo 'usage: make db-revision ID=0004 NAME="what it does"' >&2; exit 2; }
 > uv run --locked alembic revision --rev-id "$(ID)" -m "$(NAME)"
