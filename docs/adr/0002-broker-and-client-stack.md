@@ -96,6 +96,12 @@ SQLAlchemy's default for a bare `postgresql://` changed between versions. Postgr
 19.0 (`postgres:19.0`, pinned by digest in `compose.yaml`), the current major release; nothing
 depends on a feature new in 19.
 
+**Update 2026-11-24 (phase 5, slice 1):** the two provisional settings of decision 5 are settled
+by [ADR 0004](0004-offsets-and-database.md), decisions 9–11: `partition.assignment.strategy` is
+`cooperative-sticky`, and offsets stay committed per message with `commit(message)`, without
+`enable.auto.offset.store=false` and `store_offsets`. Nothing calls `commit()` without arguments,
+so the `_NO_OFFSET` case in the consequences below does not arise. KIP-848 was still not evaluated.
+
 ## Consequences
 
 - The consumer loop reads top to bottom with no event loop, so the order "database commit, then

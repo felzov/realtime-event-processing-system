@@ -31,7 +31,8 @@ flowchart LR
 
 - **At-least-once delivery.** The same event can reach the consumer more than once: a client
   retry, a producer retry, a consumer crash or a rebalance. A duplicate `event_id` never changes an
-  aggregate twice.
+  aggregate twice; one reused for different content is detected and logged, and the first applied
+  copy stays counted (ADR 0004, decision 13).
 - **The ingest API reports only what it observed.** It answers `202 Accepted` only after the broker
   confirmed the write with `acks=all` (ADR 0003).
 - **The offset follows the database.** A consumer commits an event's offset only after the
@@ -45,8 +46,12 @@ Each becomes a claim only when a test proves it. So far:
 
 - At-least-once with deduplication, and the offset following the database: demonstrated against
   real Kafka and PostgreSQL in phase 3 (`tests/integration/test_aggregation.py`,
-  `tests/integration/test_consumer.py`, including a redelivery after crash point B). Restarts and
-  rebalances with several consumers are phase 5.
+  `tests/integration/test_consumer.py`, including a redelivery after crash point B). Restarts in
+  phase 5: a stop mid-stream, crash point A, a new group re-reading the topic
+  (`tests/integration/test_consumer.py`); and a rebalance, a second consumer joining and the first
+  leaving while events arrive (`tests/integration/test_rebalance.py`). A reused `event_id` with
+  different content: phase 5 (`tests/unit/test_fingerprint.py`,
+  `tests/integration/test_aggregation.py`, `tests/integration/test_consumer.py`).
 - Ingest reporting only what it observed: phase 2 (`tests/api/test_events.py`,
   `tests/integration/test_ingest_api.py`).
 - Event time decides the window, and late or future events do not count: phases 1 and 4
@@ -72,11 +77,12 @@ sequenceDiagram
     C->>C: classify by received_at (ADR 0005)
     Note over C: late, future or no valid received_at: log, skip the database, commit offset n + 1
     C->>DB: BEGIN
-    C->>DB: INSERT processed_events (event_id) ON CONFLICT DO NOTHING
+    C->>DB: INSERT processed_events (event_id, body_sha256) ON CONFLICT DO NOTHING
     alt inserted (first time)
         C->>DB: upsert aggregate (store_id, currency, window_start)
     else conflict (duplicate)
-        C->>C: skip the aggregate update
+        C->>DB: SELECT the stored body_sha256
+        C->>C: skip the aggregate update; a different fingerprint is logged as conflicting_duplicate
     end
     Note over C: crash point A (anywhere before COMMIT)
     C->>DB: COMMIT
@@ -99,8 +105,12 @@ The same reasoning applies at ingest. If the API crashes after the broker acknow
 but before it answered the client, the client retries with the same `event_id`, the topic holds
 the event twice, and deduplication in the consumer absorbs it.
 
-The diagram shows one offset commit per event, synchronous, as ADR 0004 decided. What happens to
-an uncommitted event when its partition moves to another consumer (a rebalance) is phase 5.
+The diagram shows one offset commit per event, synchronous, as ADR 0004 decided. A rebalance can
+refuse that offset commit; the consumer logs it and goes on (ADR 0004, decision 10). The event's
+effect is already in PostgreSQL, so this is crash point B without the crash: if the partition moves,
+its new owner redelivers the event and the `processed_events` insert absorbs it. Nothing is
+committed when partitions are revoked: that happens only inside `poll`, and the loop never polls
+between an event's two commits (decision 11).
 
 ## Components
 
@@ -115,12 +125,12 @@ business rules.
 | `broker/` producer, ingest API (`POST /events`) | Validate, produce with `acks=all`, answer after the broker acknowledged | 2 | Built |
 | `/health`, `/ready` | Liveness; readiness of the broker, the topic, the producer's poll thread, and the database at the expected migration revision (own readiness engine, each check bounded) | 2, 3 | Built |
 | PostgreSQL in Docker Compose (`make up`) | Local database and the `_test` database for integration tests | 3 | Built |
-| `data/` tables and migrations | `order_aggregates` and `processed_events`; Alembic revision 0001 with CHECKs from the contract (`make db-migrate`) | 3 | Built |
-| `services/` apply (`apply_order_placed`) | Deduplicate by `event_id` and upsert the aggregate in one transaction; a duplicate changes nothing, any database error rolls back both | 3 | Built |
-| `consumer/` (`make consumer`) | Poll loop; offset committed synchronously after the apply transaction; invalid message logged and skipped; any failure stops the process without committing; SIGTERM finishes the current event | 3 | Built |
+| `data/` tables and migrations | `order_aggregates` and `processed_events`; Alembic revision 0001 with CHECKs from the contract, 0002 adds each event's fingerprint (`make db-migrate`) | 3, 5 | Built |
+| `services/` apply (`apply_order_placed`) | Deduplicate by `event_id` and upsert the aggregate in one transaction; a duplicate changes nothing, one with a different fingerprint is reported as a conflicting duplicate; any database error rolls back both | 3, 5 | Built |
+| `consumer/` (`make consumer`) | Poll loop; offset committed synchronously after the apply transaction; invalid message logged and skipped; any other failure stops the process without committing; SIGTERM finishes the current event | 3 | Built |
 | Query API (`GET /stores/{store_id}/aggregates`) | Read a store's aggregates in `[from, to)` from PostgreSQL only; parameters validated with the contract's rules and reason codes | 3 | Built |
 | Late-event policy (`domain/lateness.py`) | An event counts only if `received_at − occurred_at` ≤ `ALLOWED_LATENESS_S`; the consumer skips late, future and unstamped events (logged, offset committed); ingest rejects events from the future (ADR 0005) | 4 | Built |
-| Restart and rebalance handling | Offset behaviour on restart, commit on partition revoke | 5 | Not built |
+| Restart and rebalance handling | Restart resumes at the committed offset (tested); `cooperative-sticky` assignment; an offset commit refused by a membership change is a WARNING, not a failure; assignments and revocations logged (ADR 0004, decisions 9-12) | 5 | Built |
 | Dead-letter path and replay | Route poison and late events with a reason code; replay procedure | 6 | Not built |
 | Failure tests | Process kill, database down, broker down | 7 | Not built |
 | Guarantee and limitation docs, measurements | Written guarantees and a repeatable measurement script | 8 | Not built |

@@ -163,7 +163,7 @@ def test_invalid_database_url_is_rejected_without_echoing_it(url: str, message: 
     assert DB_PASSWORD not in str(exc_info.value)
 
 
-def test_consumer_config_sets_the_adr_0004_offset_policy() -> None:
+def test_consumer_config_sets_the_adr_0004_offset_policy_and_strategy() -> None:
     config = consumer_config(
         make_settings(consumer_group_id="aggregator-test", consumer_max_poll_interval_ms=120_000)
     )
@@ -174,6 +174,7 @@ def test_consumer_config_sets_the_adr_0004_offset_policy() -> None:
         "enable.auto.commit": False,
         "auto.offset.reset": "earliest",
         "max.poll.interval.ms": 120_000,
+        "partition.assignment.strategy": "cooperative-sticky",
     }
 
 

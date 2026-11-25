@@ -35,8 +35,9 @@ DEFAULT_LATENESS = LatenessPolicy(
     max_future_skew=timedelta(seconds=DEFAULT_MAX_FUTURE_SKEW_S),
 )
 
-# Statements one applied event can run: the pool's pre-ping, the processed_events insert, the
-# aggregate upsert and COMMIT (services/aggregation.py).
+# Statements one event can run: the pool's pre-ping, the processed_events insert, then either the
+# aggregate upsert (new event) or the select of the stored fingerprint (duplicate), and COMMIT
+# (services/aggregation.py).
 DB_STATEMENTS_PER_EVENT = 4
 # How many times that worst case must fit into max.poll.interval.ms, so it stays well under it.
 POLL_INTERVAL_MARGIN = 2

@@ -10,8 +10,8 @@ poison events), not feature breadth.
 
 ## Status
 
-Phases 1 (event contract), 2 (ingest), 3 (consumer and durable aggregate) and 4 (late events) are
-built:
+Phases 1 (event contract), 2 (ingest), 3 (consumer and durable aggregate), 4 (late events) and 5
+(duplicates, restarts, rebalances) are built:
 
 - `POST /events` validates an event and answers `202` only after Kafka acknowledged it with
   `acks=all` ([ADR 0003](docs/adr/0003-ingest-acknowledgement.md)).
@@ -21,9 +21,12 @@ built:
 - An event counts only if it reached the API within `ALLOWED_LATENESS_S` (5 min) of its
   `occurred_at`; the consumer skips later ones, and the API rejects events from the future
   ([ADR 0005](docs/adr/0005-late-events.md)).
+- A restarted consumer resumes at its committed offset, and consumers can join or leave the group
+  while events arrive without stopping each other. An `event_id` reused for different content is
+  logged as `conflicting_duplicate` and not counted (ADR 0004, phase 5 update).
 - `GET /stores/{store_id}/aggregates` reads the aggregates from PostgreSQL.
 
-Rebalances, the dead-letter path and failure tests come in later phases; the
+The dead-letter path and failure tests come in later phases; the
 [component table](docs/architecture.md#components) has the build order. This is a learning project,
 not a production service.
 
@@ -60,8 +63,16 @@ is created only when the data volume is new (`docker/postgres-init/`). The passw
 The schema comes from hand-written Alembic migrations in `migrations/`, each with a working
 downgrade. `make db-migrate` applies them to the database in `DATABASE_URL`; the integration tests
 migrate the test database themselves, down to an empty schema and back up. A new migration starts
-from `make db-revision ID=0002 NAME="what it does"`, and `EXPECTED_REVISION` in
+from `make db-revision ID=0003 NAME="what it does"`, and `EXPECTED_REVISION` in
 `src/event_pipeline/data/tables.py` must name the new head (a unit test checks it).
+
+After pulling a change that adds a migration, run `make db-migrate` before starting the API or the
+consumer. Until then `/ready` answers `migration_mismatch`, and the consumer stops on the first
+event it applies (late, future and invalid messages are still skipped before that); nothing is
+lost, and that event is redelivered when the consumer is restarted after the migration. When
+deploying, migrate first, then replace the code: `/ready` checks for exactly the revision the code
+expects, so API processes still running the old code answer `migration_mismatch` until they are
+replaced, while their ingest and query paths, and an old consumer, keep working.
 
 Integration tests create their own `test.<id>` topics and do not delete them; they stay in the
 Kafka data volume until it is removed.
@@ -100,10 +111,11 @@ curl -s "127.0.0.1:8000/stores/store-7/aggregates?from=$FROM&to=$TO"
 ```
 
 Sending the same event again (same `EVENT_ID`) changes nothing: the consumer recognises its
-`event_id`. An `occurred_at` more than `ALLOWED_LATENESS_S` in the past is accepted but not
-counted, and the consumer logs `late_event`; one more than `MAX_FUTURE_SKEW_S` (60 s) ahead is
-rejected with `422`. Timestamps in a query string are RFC 3339; write a `+` offset as `%2B` (a
-bare `+` means a space in a URL) or use `Z`.
+`event_id`. Sending another event with the same `EVENT_ID` (a different amount, say) changes
+nothing either, and the consumer logs `conflicting_duplicate`. An `occurred_at` more than
+`ALLOWED_LATENESS_S` in the past is accepted but not counted, and the consumer logs `late_event`;
+one more than `MAX_FUTURE_SKEW_S` (60 s) ahead is rejected with `422`. Timestamps in a query
+string are RFC 3339; write a `+` offset as `%2B` (a bare `+` means a space in a URL) or use `Z`.
 
 | Endpoint | Answer |
 |----------|--------|
@@ -126,8 +138,8 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
 
 - No authentication or rate limiting, and the broker and database connections are plaintext:
   local use only.
-- One API process holds one producer; running several is untested. One consumer process has been
-  tested; several in one group are untested until phase 5.
+- One API process holds one producer; running several is untested. Two consumers in one group
+  have been tested (one joining and one leaving while events arrive); larger groups have not.
 - `/ready` does not detect a fatal producer error (ADR 0003, limitations), and an outage logs one
   warning per probe. A database outage takes ingest out of rotation too: one process serves both.
 - The database's timeouts are enforced by PostgreSQL: a server that stops answering after
@@ -155,11 +167,27 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
   consumer each time it is redelivered, which blocks its partition until the dead-letter path
   (phase 6). An invalid message on the topic is logged and skipped: it is lost apart from the log
   line.
-- A commit that lands during a consumer group rebalance stops the consumer (status `1`; nothing is
-  lost or counted twice); committing on partition revoke is phase 5.
+- An offset commit refused because the group's membership changed (a rebalance or an eviction:
+  `ILLEGAL_GENERATION`, `UNKNOWN_MEMBER_ID`, `REBALANCE_IN_PROGRESS`) is logged as a WARNING and the
+  consumer goes on; the event may be redelivered and is then counted as a duplicate (ADR 0004,
+  decision 10). Exceeding `CONSUMER_MAX_POLL_INTERVAL_MS` still stops the consumer (status `1`).
+  Such a refusal is not retried: the partition's offset stays behind until its next message is
+  committed, or until a restart redelivers from it. A group that keeps rebalancing can keep offsets
+  behind for long (the aggregates stay correct, restarts redeliver more), and shows it only as
+  repeated WARNINGs.
+- Every consumer of a group must use the same assignment strategy (`cooperative-sticky` since
+  phase 5): stop consumers started from an older version before starting this one, or it stops
+  with `INCONSISTENT_GROUP_PROTOCOL`.
 - Stopping the consumer during an event slower than `CONSUMER_CLOSE_TIMEOUT_S` ends with status `2`
   and that event rolled back; it is redelivered on restart.
 - `processed_events` grows by one row per event and is never pruned yet.
+- An `event_id` reused for different content is only logged (`conflicting_duplicate`, with the
+  `event_id`, partition and offset): the first applied copy stays counted and nobody tells the
+  sender. "Different" compares the parsed event (`received_at` excluded, `occurred_at` as a UTC
+  instant to the microsecond), so a future `schema_version` 2 copy of a version 1 event would be
+  reported as a conflict, and so would every earlier event after a change to how the fingerprint is
+  computed. Events recorded before migration `0002` (or by code from before it) have no
+  fingerprint; a reused `event_id` of one of those is a plain duplicate.
 - A query answers at most one row per minute window and currency, 1440 windows per currency for
   the 24 h maximum; the number of currencies is not capped. `revenue_minor` is a JSON integer:
   JavaScript clients lose precision above 2^53.

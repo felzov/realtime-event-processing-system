@@ -1,7 +1,10 @@
 """Apply one valid `order.placed` event to its aggregate, at most once per `event_id` (ADR 0004).
 
-One transaction: record the event_id in processed_events, and only if it was new, add the order to
-its window's row. A duplicate changes nothing. Any database error propagates after the transaction
+One transaction: record the event_id in processed_events with the event's fingerprint, and only if
+it was new, add the order to its window's row. A duplicate changes nothing. A duplicate whose
+fingerprint differs from the stored one is a conflicting duplicate (ADR 0004, decision 13): the
+same event_id reused for different content. It changes nothing either; the first applied copy
+stays counted, and the caller reports it. Any database error propagates after the transaction
 is rolled back, so neither table changes; the consumer then stops without committing the offset
 (ADR 0004, decision 6), and the event is redelivered after a restart.
 
@@ -18,8 +21,13 @@ from enum import Enum
 
 from sqlalchemy import Engine
 
-from event_pipeline.data.aggregates import add_order_to_aggregate, record_processed_event
+from event_pipeline.data.aggregates import (
+    add_order_to_aggregate,
+    record_processed_event,
+    recorded_fingerprint,
+)
 from event_pipeline.domain.events import OrderPlacedEvent
+from event_pipeline.domain.fingerprint import fingerprint
 from event_pipeline.domain.windows import window_start
 
 
@@ -27,12 +35,19 @@ class ApplyOutcome(Enum):
     APPLIED = "applied"
     # The event_id was already recorded: this delivery is a redelivery or a client retry.
     DUPLICATE = "duplicate"
+    # The event_id was already recorded with different content; the first applied copy stays.
+    CONFLICTING_DUPLICATE = "conflicting_duplicate"
 
 
 def apply_order_placed(engine: Engine, event: OrderPlacedEvent) -> ApplyOutcome:
     """Apply `event` in one committed transaction and report whether it changed the aggregate."""
+    body_sha256 = fingerprint(event)
     with engine.begin() as connection:
-        if not record_processed_event(connection, event.event_id):
+        if not record_processed_event(connection, event.event_id, body_sha256):
+            stored = recorded_fingerprint(connection, event.event_id)
+            # None: recorded before revision 0002, nothing to compare with.
+            if stored is not None and stored != body_sha256:
+                return ApplyOutcome.CONFLICTING_DUPLICATE
             return ApplyOutcome.DUPLICATE
         add_order_to_aggregate(
             connection,
