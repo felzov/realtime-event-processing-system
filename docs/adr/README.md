@@ -11,4 +11,4 @@ the same file.
 | [0003](0003-ingest-acknowledgement.md) | Ingest acknowledgement | Accepted |
 | [0004](0004-offsets-and-database.md) | Offsets and database consistency | Accepted |
 | [0005](0005-late-events.md) | Late and future events | Accepted |
-| 0006 | Dead letters and replay | Planned (phase 6) |
+| [0006](0006-dead-letters-and-replay.md) | Dead letters and replay | Accepted |

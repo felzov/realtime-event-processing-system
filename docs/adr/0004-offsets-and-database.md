@@ -151,6 +151,16 @@ commit in `on_revoke`, useful only with batched commits, which this project does
 keeping every commit failure fatal, which would crash a consumer each time another one joins or
 leaves.
 
+**Update 2026-11-25 (phase 6, slice 1):** ADR 0006 changes four decisions here; the consumer follows
+them from phase 6, slices 2 and 3, and until then behaves as decided above. Decision 6: a database
+error whose SQLSTATE class is `22` or `23` dead-letters the event and moves the offset on; any other
+database error is retried in place a bounded number of times before the consumer stops; any other
+exception still stops it at once. Decision 7: an invalid message is written to the `dead_letters`
+table before its offset is committed, instead of only being logged. Decision 8: `processed_events`
+keeps its rows indefinitely, so a replay of any age is deduplicated. Decision 13: a conflicting
+duplicate is also written to `dead_letters` before its offset is committed. The offset rule itself
+(decisions 1 and 3) is unchanged: a dead letter's transaction commits before its offset.
+
 ## Consequences
 
 - The guarantee is **at-least-once delivery with an idempotent effect**: every acknowledged event
@@ -163,7 +173,7 @@ leaves.
   of one consumer is bounded by those round trips; no figure is claimed (phase 8 measures).
 - An event that can never be applied (for example a `bigint` overflow of `revenue_minor`) makes the
   consumer exit, restart and fail again on the same message, so its partition stops. This is the
-  known gap until phase 6.
+  known gap until phase 6; ADR 0006 (decision 4) dead-letters it instead.
 - Every consumer, current or future, must use the same apply transaction. A second write path to
   `order_aggregates` that skips `processed_events` would break decision 2.
 - Same `event_id` with a different body: the second one is treated as a duplicate and ignored.

@@ -51,6 +51,13 @@ defaults are assumptions.
 7. **The policy in force when a message is processed decides.** Changing `ALLOWED_LATENESS_S` and
    then replaying the topic classifies the old messages under the new value.
 
+**Update 2026-11-25 (phase 6, slice 1):** decision 4 is replaced by ADR 0006 (built in phase 6,
+slice 2; until then decision 4 holds): a late or future event, and a message without a valid
+`received_at` header, is written to the `dead_letters` table with its reason code and delay before
+its offset is committed, and the WARNING line stays. Decision 7 applies to a replay of dead letters
+too: the replay publishes the original `received_at`, so the event is classified again under the
+limits in force when it is read.
+
 ## Consequences
 
 - **Deterministic.** Both instants are part of the message, so every delivery of one message is
@@ -76,7 +83,7 @@ defaults are assumptions.
 - **`received_at` is trusted.** Anyone who can write to the topic can set the header, the same
   trust as the message itself (the broker connection is local and unauthenticated).
 - **Late events are only in the topic and the logs** until phase 6. They can be neither counted
-  nor listed through the API.
+  nor listed through the API. From phase 6 they are kept in `dead_letters` (ADR 0006).
 - **Tests and examples must use the current time.** An event sent through the API with a fixed
   `occurred_at` becomes late as soon as that time is more than 5 minutes ago.
 
