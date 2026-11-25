@@ -35,7 +35,9 @@ def consumer_config(settings: Settings) -> ClientConfig:
       database transaction holding its effect has committed (ADR 0004, decisions 1 and 3).
     - `auto.offset.reset=earliest`: a group with no committed offset starts at the beginning of
       each partition, so events produced before the consumer first ran are counted (decision 4).
-    - The partition assignment strategy is librdkafka's default (decision 5).
+    - `cooperative-sticky`: a rebalance stops only the partitions that move to another consumer
+      (decision 9). Every consumer of a group must use the same strategy: stop the old ones before
+      switching, or the new one gets INCONSISTENT_GROUP_PROTOCOL and stops.
     """
     return {
         "bootstrap.servers": settings.kafka_bootstrap_servers,
@@ -43,4 +45,5 @@ def consumer_config(settings: Settings) -> ClientConfig:
         "enable.auto.commit": False,
         "auto.offset.reset": "earliest",
         "max.poll.interval.ms": settings.consumer_max_poll_interval_ms,
+        "partition.assignment.strategy": "cooperative-sticky",
     }

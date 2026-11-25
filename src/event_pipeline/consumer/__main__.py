@@ -24,7 +24,7 @@ import sys
 import threading
 from types import FrameType
 
-from confluent_kafka import Consumer, KafkaError
+from confluent_kafka import Consumer, KafkaError, TopicPartition
 
 from event_pipeline.broker.config import consumer_config
 from event_pipeline.config import Settings
@@ -101,6 +101,40 @@ def log_client_error(error: KafkaError) -> None:
         logger.warning("kafka client error: %s: %s", error.name(), error.str())
 
 
+def log_assigned(consumer: Consumer, partitions: list[TopicPartition]) -> None:
+    """`on_assign`. Logs only: the client applies the assignment itself after the callback
+    returns (ADR 0004, decision 11; seen in the phase 5 spike)."""
+    logger.info("partitions assigned: %s", describe_partitions(partitions))
+
+
+def log_revoked(consumer: Consumer, partitions: list[TopicPartition]) -> None:
+    """`on_revoke`. Nothing to commit: the loop commits each event's offset before it polls again,
+    and partitions are revoked only inside `poll` (decision 11)."""
+    logger.info("partitions revoked: %s", describe_partitions(partitions))
+
+
+def log_lost(consumer: Consumer, partitions: list[TopicPartition]) -> None:
+    """`on_lost`: the group dropped this consumer (for example, `max.poll.interval.ms` exceeded),
+    so other members may already own these partitions."""
+    logger.warning("partitions lost: %s", describe_partitions(partitions))
+
+
+def describe_partitions(partitions: list[TopicPartition]) -> str:
+    """`topic [0, 3]` per topic, or `none`. A cooperative rebalance can call back with no
+    partitions for a member whose assignment does not change."""
+    by_topic: dict[str, list[int]] = {}
+    for partition in partitions:
+        by_topic.setdefault(partition.topic, []).append(partition.partition)
+    if not by_topic:
+        return "none"
+    return ", ".join(f"{topic} {sorted(numbers)}" for topic, numbers in sorted(by_topic.items()))
+
+
+def subscribe(consumer: Consumer, topic: str) -> None:
+    """Subscribe with the rebalance callbacks; the integration tests subscribe the same way."""
+    consumer.subscribe([topic], on_assign=log_assigned, on_revoke=log_revoked, on_lost=log_lost)
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings()
@@ -112,7 +146,7 @@ def main() -> int:
     consumer = Consumer({**consumer_config(settings), "error_cb": log_client_error})
     status = 0
     try:
-        consumer.subscribe([settings.events_topic])
+        subscribe(consumer, settings.events_topic)
         logger.info("consuming %s as group %s", settings.events_topic, settings.consumer_group_id)
 
         def apply(event: OrderPlacedEvent) -> ApplyOutcome:

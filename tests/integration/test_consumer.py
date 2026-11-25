@@ -27,6 +27,7 @@ from event_pipeline.broker.config import consumer_config, producer_config
 from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, EventPublisher, format_received_at
 from event_pipeline.broker.topics import TopicSpec, ensure_topic
 from event_pipeline.config import Settings
+from event_pipeline.consumer.__main__ import subscribe
 from event_pipeline.consumer.loop import CommittedPartition, Headers, run
 from event_pipeline.data.tables import order_aggregates, processed_events
 from event_pipeline.domain.events import OrderPlacedEvent
@@ -142,7 +143,7 @@ def ask_coordinator[T](query: Callable[[], T]) -> T:
         time.sleep(0.2)
 
 
-def committed_offsets(settings: Settings) -> dict[int, int]:
+def committed_offsets(settings: Settings, partitions: int = PARTITIONS) -> dict[int, int]:
     """The group's committed offset per partition; partitions with none are left out."""
     reader = Consumer(
         {
@@ -152,17 +153,17 @@ def committed_offsets(settings: Settings) -> dict[int, int]:
         }
     )
     try:
-        partitions = [TopicPartition(settings.events_topic, p) for p in range(PARTITIONS)]
+        wanted = [TopicPartition(settings.events_topic, p) for p in range(partitions)]
         return {
             tp.partition: tp.offset
-            for tp in ask_coordinator(lambda: reader.committed(partitions, timeout=TIMEOUT_S))
+            for tp in ask_coordinator(lambda: reader.committed(wanted, timeout=TIMEOUT_S))
             if tp.offset >= 0
         }
     finally:
         reader.close()
 
 
-def end_offsets(settings: Settings) -> dict[int, int]:
+def end_offsets(settings: Settings, partitions: int = PARTITIONS) -> dict[int, int]:
     """Next offset to be written per partition, for partitions that hold messages."""
     reader = Consumer(
         {
@@ -173,7 +174,7 @@ def end_offsets(settings: Settings) -> dict[int, int]:
     )
     try:
         ends = {}
-        for p in range(PARTITIONS):
+        for p in range(partitions):
             _, high = reader.get_watermark_offsets(
                 TopicPartition(settings.events_topic, p), timeout=TIMEOUT_S
             )
@@ -224,7 +225,8 @@ class RunningConsumer:
         stop_flag: threading.Event | None = None,
     ) -> None:
         self.consumer = Consumer(consumer_config(settings))
-        self.consumer.subscribe([settings.events_topic])
+        # With the process's rebalance callbacks (consumer/__main__.py), so they are exercised too.
+        subscribe(self.consumer, settings.events_topic)
         self.stop_flag = stop_flag or threading.Event()
         self.error: BaseException | None = None
         self.outcomes: list[ApplyOutcome] = []

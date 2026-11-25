@@ -1,4 +1,4 @@
-"""The consumer process's watchdog and client error callback."""
+"""The consumer process's watchdog, client error callback and rebalance callbacks."""
 
 import logging
 import os
@@ -8,10 +8,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from confluent_kafka import KafkaError
+from confluent_kafka import KafkaError, TopicPartition
 
 from event_pipeline.consumer import __main__ as consumer_main
-from event_pipeline.consumer.__main__ import EXIT_CLOSE_TIMEOUT, CloseWatchdog, log_client_error
+from event_pipeline.consumer.__main__ import (
+    EXIT_CLOSE_TIMEOUT,
+    CloseWatchdog,
+    describe_partitions,
+    log_assigned,
+    log_client_error,
+    log_lost,
+    log_revoked,
+)
 from event_pipeline.domain.lateness import LatenessPolicy
 
 
@@ -87,8 +95,13 @@ def test_arm_and_cancel_survive_a_signal_handler_arming_in_the_middle(
 
 
 class _StubConsumer:
-    def __init__(self, config: dict[str, Any]) -> None: ...
-    def subscribe(self, topics: list[str]) -> None: ...
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        self.callbacks: dict[str, Any] = {}
+
+    def subscribe(self, topics: list[str], **callbacks: Any) -> None:
+        self.callbacks = callbacks
+
     def close(self) -> None: ...
 
 
@@ -113,4 +126,61 @@ def test_main_runs_the_loop_with_the_configured_lateness_policy(
     assert consumer_main.main() == 0
     assert seen["lateness"] == LatenessPolicy(
         allowed_lateness=timedelta(seconds=17), max_future_skew=timedelta(seconds=3)
+    )
+
+
+def test_main_subscribes_with_the_rebalance_callbacks_and_the_cooperative_strategy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # no .env
+    made: list[_StubConsumer] = []
+
+    def make_consumer(config: dict[str, Any]) -> _StubConsumer:
+        made.append(_StubConsumer(config))
+        return made[-1]
+
+    monkeypatch.setattr(consumer_main, "Consumer", make_consumer)
+    monkeypatch.setattr(consumer_main, "make_engine", lambda settings: _StubEngine())
+    monkeypatch.setattr(consumer_main, "_stop_on_signals", lambda stop, watchdog: None)
+    monkeypatch.setattr(consumer_main, "run", lambda *args, **kwargs: None)
+
+    assert consumer_main.main() == 0
+    [consumer] = made
+    assert consumer.callbacks == {
+        "on_assign": log_assigned,
+        "on_revoke": log_revoked,
+        "on_lost": log_lost,
+    }
+    assert consumer.config["partition.assignment.strategy"] == "cooperative-sticky"
+
+
+@pytest.mark.parametrize(
+    ("callback", "level", "text"),
+    [
+        (log_assigned, logging.INFO, "partitions assigned: "),
+        (log_revoked, logging.INFO, "partitions revoked: "),
+        (log_lost, logging.WARNING, "partitions lost: "),
+    ],
+)
+def test_rebalance_callbacks_only_log(
+    callback: Any, level: int, text: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    partitions = [TopicPartition("events", 3), TopicPartition("events", 0)]
+    consumer = object()  # any call on it would fail: the callbacks must not touch the consumer
+
+    with caplog.at_level(logging.INFO, logger="event_pipeline.consumer"):
+        callback(consumer, partitions)
+
+    [record] = caplog.records
+    assert record.levelno == level
+    assert record.getMessage() == text + "events [0, 3]"
+
+
+def test_describe_partitions_groups_by_topic_and_says_none_for_an_empty_list() -> None:
+    assert describe_partitions([]) == "none"
+    assert (
+        describe_partitions(
+            [TopicPartition("b", 1), TopicPartition("a", 2), TopicPartition("b", 0)]
+        )
+        == "a [2], b [0, 1]"
     )

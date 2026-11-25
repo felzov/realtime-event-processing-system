@@ -11,10 +11,13 @@ For each message:
 4. Any other valid event is applied in one database transaction; then its offset + 1 is committed
    synchronously (decisions 1 and 3). A duplicate is committed the same way.
 
-Any error from polling, applying or committing ends the loop without committing that message's
-offset: the error is logged and raised as `ConsumerFailedError`, and the process exits non-zero.
-A restart redelivers from the last committed offset, and the duplicates table absorbs what was
-already applied (decision 6).
+A commit refused because the consumer's group membership changed under it (a rebalance, or an
+eviction) is logged at WARNING and the loop carries on (decision 10): the event's effect is already
+in the database, so at worst it is redelivered and counted as a duplicate. Any other error from
+polling, applying or committing ends the loop without committing that message's offset: the error
+is logged and raised as `ConsumerFailedError`, and the process exits non-zero. A restart redelivers
+from the last committed offset, and the duplicates table absorbs what was already applied
+(decision 6).
 
 The stop flag is checked between messages, so a stop request never interrupts an event between
 its database commit and its offset commit.
@@ -73,6 +76,18 @@ class MessageSource[M: Message](Protocol):
     def commit(
         self, *, message: M, asynchronous: Literal[False]
     ) -> Sequence[CommittedPartition] | None: ...
+
+
+# Commit errors that only say the group's membership changed under the commit (ADR 0004,
+# decision 10). ILLEGAL_GENERATION (a rebalance) and UNKNOWN_MEMBER_ID (after an eviction) were seen
+# in the phase 5 spike; REBALANCE_IN_PROGRESS was not, but Kafka defines it for the same situation.
+MEMBERSHIP_CHANGED_COMMIT_ERRORS = frozenset(
+    {
+        KafkaError.ILLEGAL_GENERATION,
+        KafkaError.UNKNOWN_MEMBER_ID,
+        KafkaError.REBALANCE_IN_PROGRESS,
+    }
+)
 
 
 class OffsetCommitError(Exception):
@@ -169,7 +184,7 @@ def _process[M: Message](
                 message.offset(),
             )
 
-    _commit(consumer, message)
+    _commit(consumer, message, position)
 
 
 def _not_counted_because(
@@ -207,19 +222,48 @@ def received_at_header(headers: Headers | None) -> bytes | None:
     return values[0]
 
 
-def _commit[M: Message](consumer: MessageSource[M], message: M) -> None:
+def _commit[M: Message](consumer: MessageSource[M], message: M, position: _Position) -> None:
     # Synchronous: the next message is not read before the broker stored this offset. A commit can
     # fail per partition without raising, so each returned partition's error is checked; a
     # synchronous commit always returns the partitions, so no answer counts as a failure.
-    # A commit that lands while the group rebalances fails too (REBALANCE_IN_PROGRESS,
-    # ILLEGAL_GENERATION) and stops the consumer like any other failure; committing on partition
-    # revoke is phase 5.
-    committed = consumer.commit(message=message, asynchronous=False)
+    try:
+        committed = consumer.commit(message=message, asynchronous=False)
+    except KafkaException as exc:
+        error = _kafka_error_of(exc)
+        if error is None or not _membership_changed(error):
+            raise
+        _log_not_committed(error, position)
+        return
     if committed is None:
         raise OffsetCommitError("the commit returned no partitions")
-    for partition in committed:
-        if partition.error is not None:
-            raise OffsetCommitError(_kafka_error(partition.error))
+    errors = [partition.error for partition in committed if partition.error is not None]
+    # Every error is checked before any is logged as harmless: one that is not on the list stops
+    # the loop, without a misleading "may be redelivered" line first.
+    for error in errors:
+        if not _membership_changed(error):
+            raise OffsetCommitError(_kafka_error(error))
+    for error in errors:
+        _log_not_committed(error, position)
+
+
+def _membership_changed(error: KafkaError) -> bool:
+    """Decision 10's allow-list. A fatal error never qualifies, whatever its code: the client is
+    unusable then. librdkafka reports fatal errors as _FATAL, so this is a guard, not a case seen.
+    """
+    return error.code() in MEMBERSHIP_CHANGED_COMMIT_ERRORS and not error.fatal()
+
+
+def _log_not_committed(error: KafkaError, position: _Position) -> None:
+    """Decision 10: not fatal. If the partition stays here, the next commit on it covers this
+    offset; if it moved, or the process stops first, the event is redelivered as a duplicate."""
+    logger.warning(
+        "offset not committed at partition %s offset %s event %s: %s; the group membership "
+        "changed, so the event may be redelivered",
+        position.partition,
+        position.offset,
+        position.event_id,
+        _kafka_error(error),
+    )
 
 
 def describe_error(exc: BaseException) -> str:
@@ -230,11 +274,15 @@ def describe_error(exc: BaseException) -> str:
     """
     if isinstance(exc, DBAPIError):
         return describe_database_error(exc)
-    if isinstance(exc, KafkaException) and exc.args and isinstance(exc.args[0], KafkaError):
-        return f"KafkaException {_kafka_error(exc.args[0])}"
+    if isinstance(exc, KafkaException) and (error := _kafka_error_of(exc)) is not None:
+        return f"KafkaException {_kafka_error(error)}"
     if isinstance(exc, OffsetCommitError):
         return f"OffsetCommitError {exc}"
     return type(exc).__name__
+
+
+def _kafka_error_of(exc: KafkaException) -> KafkaError | None:
+    return exc.args[0] if exc.args and isinstance(exc.args[0], KafkaError) else None
 
 
 def _kafka_error(error: KafkaError) -> str:

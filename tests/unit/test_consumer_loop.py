@@ -1,5 +1,5 @@
 """The poll loop with a fake consumer: commit order, invalid messages, failures, stopping
-(phase 3 acceptance criteria 4 and 6)."""
+(phase 3 acceptance criteria 4 and 6), commits refused by a rebalance (phase 5 criterion 3)."""
 
 import logging
 import threading
@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 import event_pipeline
 from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, format_received_at
 from event_pipeline.consumer.loop import (
+    MEMBERSHIP_CHANGED_COMMIT_ERRORS,
     ConsumerFailedError,
     Headers,
     OffsetCommitError,
@@ -90,6 +91,8 @@ class FakeConsumer:
     commit_result: list[FakePartition] | None = field(default_factory=lambda: [FakePartition()])
     commit_raises: BaseException | None = None
     poll_raises: BaseException | None = None
+    # Answers the first commit only (raised if an exception); later commits get `commit_result`.
+    first_commit: BaseException | list[FakePartition] | None = None
 
     def poll(self, timeout: float) -> FakeMessage | None:
         assert timeout == POLL_TIMEOUT_S
@@ -105,6 +108,11 @@ class FakeConsumer:
     ) -> list[FakePartition] | None:
         assert asynchronous is False
         self.calls.append(("commit", message.offset()))
+        if self.first_commit is not None:
+            first, self.first_commit = self.first_commit, None
+            if isinstance(first, BaseException):
+                raise first
+            return first
         if self.commit_raises is not None:
             raise self.commit_raises
         return self.commit_result
@@ -407,13 +415,13 @@ def test_offset_commit_failed_for_the_partition_stops_the_loop(
 ) -> None:
     # A synchronous commit can report a per-partition failure without raising.
     harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
-    harness.consumer.commit_result = [FakePartition(KafkaError(KafkaError.REBALANCE_IN_PROGRESS))]
+    harness.consumer.commit_result = [FakePartition(KafkaError(KafkaError.UNKNOWN_TOPIC_OR_PART))]
 
     with caplog.at_level(logging.ERROR):
         assert isinstance(run_until_failure(harness), OffsetCommitError)
 
     assert harness.calls == [("apply", None), ("commit", 5)]
-    assert "OffsetCommitError REBALANCE_IN_PROGRESS" in stopping_record(caplog).getMessage()
+    assert "OffsetCommitError UNKNOWN_TOPIC_OR_PART" in stopping_record(caplog).getMessage()
 
 
 def test_offset_commit_without_an_answer_stops_the_loop(caplog: pytest.LogCaptureFixture) -> None:
@@ -454,6 +462,146 @@ def test_broker_error_message_stops_the_loop_before_the_database(
     message = stopping_record(caplog).getMessage()
     assert "KafkaException UNKNOWN_TOPIC_OR_PART" in message
     assert "at partition 2 offset 0 event None" in message
+
+
+# --- Commits refused because the group membership changed (ADR 0004, decisions 10 and 12) ---------
+
+MEMBERSHIP_CHANGED = [
+    KafkaError.ILLEGAL_GENERATION,
+    KafkaError.UNKNOWN_MEMBER_ID,
+    KafkaError.REBALANCE_IN_PROGRESS,
+]
+# Commit errors that look related but say something else: they still stop the loop.
+OTHER_COMMIT_ERRORS = [
+    KafkaError.NOT_COORDINATOR,
+    KafkaError.FENCED_INSTANCE_ID,
+    KafkaError.INCONSISTENT_GROUP_PROTOCOL,
+]
+
+
+def test_the_allow_list_is_exactly_the_three_membership_codes() -> None:
+    # A code added to the list becomes non-fatal; that is an ADR 0004 decision, not an edit.
+    assert frozenset(MEMBERSHIP_CHANGED) == MEMBERSHIP_CHANGED_COMMIT_ERRORS
+
+
+def refused(code: int, how: str) -> BaseException | list[FakePartition]:
+    """A commit failure with `code`, raised or reported for the partition."""
+    if how == "raised":
+        return KafkaException(KafkaError(code))
+    return [FakePartition(KafkaError(code))]
+
+
+@pytest.mark.parametrize("how", ["raised", "for the partition"])
+@pytest.mark.parametrize("code", MEMBERSHIP_CHANGED)
+def test_commit_refused_by_a_membership_change_is_a_warning_and_the_loop_goes_on(
+    code: int, how: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
+    harness.consumer.first_commit = refused(code, how)
+
+    with caplog.at_level(logging.WARNING):
+        harness.run()
+
+    # The next message is applied and committed as usual.
+    assert harness.calls == [("apply", None), ("commit", 5), ("apply", None), ("commit", 6)]
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    message = record.getMessage()
+    assert message.startswith(
+        f"offset not committed at partition 2 offset 5 event {EVENT_ID}: "
+        f"{KafkaError(code).name()} ("
+    )
+    assert message.endswith("the event may be redelivered")
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+@pytest.mark.parametrize("how", ["raised", "for the partition"])
+@pytest.mark.parametrize("code", OTHER_COMMIT_ERRORS)
+def test_other_commit_errors_still_stop_the_loop(
+    code: int, how: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
+    harness.consumer.first_commit = refused(code, how)
+
+    with caplog.at_level(logging.WARNING):
+        run_until_failure(harness)
+
+    assert harness.calls == [("apply", None), ("commit", 5)]
+    assert KafkaError(code).name() in stopping_record(caplog).getMessage()
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+@pytest.mark.parametrize("membership_first", [True, False], ids=["allowed-first", "other-first"])
+def test_a_membership_change_does_not_hide_another_partition_error(
+    membership_first: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
+    errors = [
+        FakePartition(KafkaError(KafkaError.ILLEGAL_GENERATION)),
+        FakePartition(KafkaError(KafkaError.UNKNOWN_TOPIC_OR_PART)),
+    ]
+    harness.consumer.first_commit = errors if membership_first else errors[::-1]
+
+    with caplog.at_level(logging.WARNING):
+        assert isinstance(run_until_failure(harness), OffsetCommitError)
+
+    assert harness.calls == [("apply", None), ("commit", 5)]
+    assert "UNKNOWN_TOPIC_OR_PART" in stopping_record(caplog).getMessage()
+    # No "may be redelivered" line before the stop: it would contradict it.
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+@pytest.mark.parametrize("how", ["raised", "for the partition"])
+def test_a_fatal_error_with_an_allowed_code_still_stops_the_loop(
+    how: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
+    error = KafkaError(KafkaError.UNKNOWN_MEMBER_ID, fatal=True)
+    harness.consumer.first_commit = (
+        KafkaException(error) if how == "raised" else [FakePartition(error)]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        run_until_failure(harness)
+
+    assert harness.calls == [("apply", None), ("commit", 5)]
+    assert "UNKNOWN_MEMBER_ID" in stopping_record(caplog).getMessage()
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_a_kafka_exception_without_an_error_code_still_stops_the_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5))
+    harness.consumer.first_commit = KafkaException("no KafkaError inside")
+
+    with caplog.at_level(logging.ERROR):
+        assert isinstance(run_until_failure(harness), KafkaException)
+
+    assert harness.calls == [("apply", None), ("commit", 5)]
+
+
+def test_after_an_eviction_the_refused_commit_is_let_through_and_max_poll_stops_the_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The sequence the phase 5 spike saw: the evicted consumer's commit fails with
+    # UNKNOWN_MEMBER_ID (decision 10: a WARNING), and its next poll returns _MAX_POLL_EXCEEDED,
+    # which stops the loop: the bound on time between polls was broken (decision 12).
+    harness = Harness(
+        FakeMessage(event_bytes(), offset_=5),
+        FakeMessage(None, offset_=6, error_=KafkaError(KafkaError._MAX_POLL_EXCEEDED)),
+        FakeMessage(event_bytes(), offset_=7),
+    )
+    harness.consumer.first_commit = refused(KafkaError.UNKNOWN_MEMBER_ID, "raised")
+
+    with caplog.at_level(logging.WARNING):
+        assert isinstance(run_until_failure(harness), KafkaException)
+
+    assert harness.calls == [("apply", None), ("commit", 5)]
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "offset 5" in warning.getMessage()
+    assert "UNKNOWN_MEMBER_ID" in warning.getMessage()
+    assert "KafkaException _MAX_POLL_EXCEEDED" in stopping_record(caplog).getMessage()
 
 
 # --- Stopping ------------------------------------------------------------------------------------
