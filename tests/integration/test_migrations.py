@@ -1,5 +1,5 @@
 """The Alembic migrations against the real test database: up → down → up, the schema they leave
-behind, and the CHECK constraints of revision 0001."""
+behind, the CHECK constraints of revisions 0001 and 0002, and what 0002 does to existing rows."""
 
 import os
 import subprocess
@@ -279,3 +279,61 @@ def test_an_event_id_is_recorded_once(connection: Connection) -> None:
 
     assert isinstance(exc_info.value.orig, errors.UniqueViolation)
     assert exc_info.value.orig.diag.constraint_name == "pk_processed_events"
+
+
+# --- Revision 0002: processed_events.body_sha256 (ADR 0004, decision 13) -------------------------
+
+
+def processed_rows(engine: Engine) -> dict[uuid.UUID, bytes | None]:
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT event_id, body_sha256 FROM processed_events"))
+        return {row.event_id: row.body_sha256 for row in rows}
+
+
+def column_names(engine: Engine, table: str) -> set[str]:
+    return {column["name"] for column in inspect(engine).get_columns(table)}
+
+
+def test_revision_0002_keeps_existing_rows_without_a_fingerprint_both_ways(
+    db_engine: Engine,
+) -> None:
+    migrate(db_engine, "down", "base")
+    migrate(db_engine, "up", "0001")
+    before = uuid.uuid4()
+    with db_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO processed_events (event_id) VALUES (:id)"), {"id": before}
+        )
+
+    # Up: the existing row stays, with no fingerprint (nothing to backfill from).
+    migrate(db_engine, "up", "0002")
+    assert processed_rows(db_engine) == {before: None}
+    after = uuid.uuid4()
+    with db_engine.begin() as connection:
+        connection.execute(processed_events.insert().values(event_id=after, body_sha256=bytes(32)))
+
+    # Down: both event_ids stay; only the fingerprints go.
+    migrate(db_engine, "down", "0001")
+    assert "body_sha256" not in column_names(db_engine, "processed_events")
+    with db_engine.connect() as connection:
+        ids = connection.execute(text("SELECT event_id FROM processed_events")).scalars()
+        assert set(ids) == {before, after}
+
+    # Up again: every row is now like one from before the revision.
+    migrate(db_engine, "up", "head")
+    assert processed_rows(db_engine) == {before: None, after: None}
+
+
+@pytest.mark.parametrize("length", [0, 31, 33])
+def test_a_fingerprint_must_be_32_bytes(connection: Connection, length: int) -> None:
+    with pytest.raises(IntegrityError) as exc_info, connection.begin_nested():
+        connection.execute(
+            processed_events.insert().values(event_id=uuid.uuid4(), body_sha256=bytes(length))
+        )
+
+    assert isinstance(exc_info.value.orig, errors.CheckViolation)
+    assert exc_info.value.orig.diag.constraint_name == "ck_processed_events_body_sha256_length"
+
+
+def test_a_row_without_a_fingerprint_is_accepted(connection: Connection) -> None:
+    connection.execute(processed_events.insert().values(event_id=uuid.uuid4(), body_sha256=None))

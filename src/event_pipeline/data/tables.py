@@ -13,6 +13,7 @@ from sqlalchemy import (
     BigInteger,
     Column,
     DateTime,
+    LargeBinary,
     MetaData,
     PrimaryKeyConstraint,
     Table,
@@ -24,7 +25,7 @@ from sqlalchemy.dialects.postgresql import UUID
 # The migration revision this code is written against. A unit test checks that it is the Alembic
 # head, so adding a migration without updating it fails the tests; `/ready` is to report not ready
 # while the database is at any other revision.
-EXPECTED_REVISION: Final = "0001"
+EXPECTED_REVISION: Final = "0002"
 
 metadata = MetaData()
 
@@ -33,6 +34,8 @@ processed_events = Table(
     metadata,
     Column("event_id", UUID(as_uuid=True), nullable=False),
     Column("processed_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    # The first applied copy's fingerprint (domain/fingerprint.py); NULL: from before revision 0002.
+    Column("body_sha256", LargeBinary, nullable=True),
     PrimaryKeyConstraint("event_id", name="pk_processed_events"),
 )
 
