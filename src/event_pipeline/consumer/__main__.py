@@ -30,8 +30,10 @@ from event_pipeline.broker.config import consumer_config
 from event_pipeline.config import Settings
 from event_pipeline.consumer.loop import ConsumerFailedError, describe_error, raised_at, run
 from event_pipeline.data.engine import make_engine
+from event_pipeline.domain.dead_letters import DeadLetter
 from event_pipeline.domain.events import OrderPlacedEvent
 from event_pipeline.services.aggregation import ApplyOutcome, apply_order_placed
+from event_pipeline.services.dead_letters import store_dead_letter
 
 logger = logging.getLogger("event_pipeline.consumer")
 
@@ -152,9 +154,13 @@ def main() -> int:
         def apply(event: OrderPlacedEvent) -> ApplyOutcome:
             return apply_order_placed(engine, event)
 
+        def dead_letter(letter: DeadLetter) -> bool:
+            return store_dead_letter(engine, letter)
+
         run(
             consumer,
             apply,
+            dead_letter=dead_letter,
             stop=stop,
             poll_timeout_s=settings.consumer_poll_timeout_s,
             lateness=settings.lateness_policy(),

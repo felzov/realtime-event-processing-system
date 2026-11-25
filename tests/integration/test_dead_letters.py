@@ -4,15 +4,18 @@ Every test uses its own topic name, so tests never see each other's rows and nee
 """
 
 import dataclasses
+import threading
+import time
 import uuid
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, Row, select
+from sqlalchemy import Engine, Row, select, text
 
 from event_pipeline.data.dead_letters import record_dead_letter
 from event_pipeline.data.tables import dead_letters
 from event_pipeline.domain.dead_letters import DeadLetter, DeadLetterReason
+from event_pipeline.services.dead_letters import store_dead_letter
 
 pytestmark = pytest.mark.integration
 
@@ -34,8 +37,7 @@ def dead_letter(**overrides: Any) -> DeadLetter:
 
 
 def record(engine: Engine, letter: DeadLetter) -> bool:
-    with engine.begin() as connection:
-        return record_dead_letter(connection, letter)
+    return store_dead_letter(engine, letter)
 
 
 def stored(engine: Engine, topic: str) -> list[Row[Any]]:
@@ -124,3 +126,79 @@ def test_every_reason_is_accepted(migrated_engine: Engine, reason: DeadLetterRea
 
     assert record(migrated_engine, letter) is True
     assert stored(migrated_engine, letter.topic)[0].reason_code == reason.value
+
+
+def test_the_insert_leaves_the_transaction_to_its_caller(migrated_engine: Engine) -> None:
+    # services/ owns the transaction: rolled back there, the row is gone.
+    letter = dead_letter()
+    with migrated_engine.connect() as connection:
+        transaction = connection.begin()
+        assert record_dead_letter(connection, letter) is True
+        transaction.rollback()
+
+    assert stored(migrated_engine, letter.topic) == []
+
+
+LOCK_WAIT_DEADLINE_S = 3.0
+
+
+@pytest.mark.parametrize(
+    ("first_commits", "second_is_new"),
+    [(True, False), (False, True)],
+    ids=["first-commits", "first-rolls-back"],
+)
+def test_a_concurrent_write_of_the_same_position_waits_for_the_first(
+    migrated_engine: Engine, first_commits: bool, second_is_new: bool
+) -> None:
+    # Two consumers can read the same message around a rebalance. The second insert waits on the
+    # primary key, then conflicts if the first committed, or inserts if it rolled back.
+    letter = dead_letter()
+    result: list[bool | BaseException] = []
+
+    def second() -> None:
+        try:
+            result.append(store_dead_letter(migrated_engine, letter))
+        except BaseException as exc:  # re-raised below, in the test thread
+            result.append(exc)
+
+    with migrated_engine.connect() as first:
+        first.begin()
+        assert record_dead_letter(first, letter) is True
+        first_pid = first.execute(text("SELECT pg_backend_pid()")).scalar_one()
+        thread = threading.Thread(target=second, daemon=True)
+        thread.start()
+        try:
+            wait_until_blocked_by(migrated_engine, first_pid, thread)
+        except BaseException:
+            first.rollback()
+            thread.join(timeout=10)
+            raise
+        if first_commits:
+            first.commit()
+        else:
+            first.rollback()
+
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the second write did not finish"
+    [outcome] = result
+    if isinstance(outcome, BaseException):
+        raise outcome
+    assert outcome is second_is_new
+    assert len(stored(migrated_engine, letter.topic)) == 1
+
+
+def wait_until_blocked_by(engine: Engine, first_pid: int, thread: threading.Thread) -> None:
+    """Return once some backend waits for a lock held by `first_pid` (as in test_aggregation)."""
+    query = text(
+        "SELECT count(*) FROM pg_stat_activity WHERE :first_pid = ANY(pg_blocking_pids(pid))"
+    )
+    deadline = time.monotonic() + LOCK_WAIT_DEADLINE_S
+    with engine.connect() as connection:
+        while connection.execute(query, {"first_pid": first_pid}).scalar_one() == 0:
+            # pg_stat_activity is a per-transaction snapshot: end it to see new backends.
+            connection.rollback()
+            if not thread.is_alive():
+                pytest.fail("the second write did not wait for the first")
+            if time.monotonic() > deadline:
+                pytest.fail("the second write never waited for the first transaction")
+            time.sleep(0.02)

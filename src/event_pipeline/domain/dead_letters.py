@@ -1,8 +1,9 @@
 """What the dead-letter table holds and why a message is in it (ADR 0006).
 
-A dead letter is a message the consumer did not count, kept as it was read from the topic (key,
-value bytes and the `received_at` header) with the reason it was not counted. Its position on the
-topic identifies it: a redelivery of the same message is the same dead letter.
+A dead letter is a message the consumer did not count, kept as it was read from the topic (key and
+value bytes, and the `received_at` header when there is exactly one with a bytes value) with the
+reason it was not counted. Its position on the topic identifies it: a redelivery of the same
+message is the same dead letter.
 """
 
 from dataclasses import dataclass

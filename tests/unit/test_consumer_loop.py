@@ -22,8 +22,10 @@ from event_pipeline.consumer.loop import (
     OffsetCommitError,
     describe_error,
     raised_at,
+    received_at_header,
     run,
 )
+from event_pipeline.domain.dead_letters import DeadLetter, DeadLetterReason
 from event_pipeline.domain.events import OrderPlacedEvent
 from event_pipeline.domain.lateness import LatenessPolicy
 from event_pipeline.services.aggregation import ApplyOutcome
@@ -52,6 +54,10 @@ def event_bytes(**payload: Any) -> bytes:
     return encode(body)
 
 
+TOPIC = "orders.placed.v1"
+KEY = b"store-key"
+
+
 @dataclass
 class FakeMessage:
     raw: bytes | None
@@ -62,6 +68,12 @@ class FakeMessage:
 
     def error(self) -> KafkaError | None:
         return self.error_
+
+    def topic(self) -> str | None:
+        return TOPIC
+
+    def key(self) -> bytes | None:
+        return KEY
 
     def value(self) -> bytes | None:
         return self.raw
@@ -127,16 +139,24 @@ class Harness:
         self.apply_result: Callable[[OrderPlacedEvent], ApplyOutcome] = lambda event: (
             ApplyOutcome.APPLIED
         )
+        self.dead_letters: list[DeadLetter] = []
+        self.dead_letter_result: Callable[[DeadLetter], bool] = lambda letter: True
 
     def apply(self, event: OrderPlacedEvent) -> ApplyOutcome:
         self.calls.append(("apply", None))
         self.applied.append(event)
         return self.apply_result(event)
 
+    def dead_letter(self, letter: DeadLetter) -> bool:
+        self.calls.append(("dead_letter", letter.offset))
+        self.dead_letters.append(letter)
+        return self.dead_letter_result(letter)
+
     def run(self) -> None:
         run(
             self.consumer,
             self.apply,
+            dead_letter=self.dead_letter,
             stop=self.stop,
             poll_timeout_s=POLL_TIMEOUT_S,
             lateness=LATENESS,
@@ -176,8 +196,17 @@ def test_a_conflicting_duplicate_is_logged_without_values_and_committed(
     with caplog.at_level(logging.WARNING):
         harness.run()
 
-    # Committed like any duplicate; the next message is handled as usual.
-    assert harness.calls == [("apply", None), ("commit", 5), ("apply", None), ("commit", 6)]
+    # Dead-lettered, then committed; the next message is handled as usual.
+    assert harness.calls == [
+        ("apply", None),
+        ("dead_letter", 5),
+        ("commit", 5),
+        ("apply", None),
+        ("commit", 6),
+    ]
+    [letter] = harness.dead_letters
+    assert letter.reason is DeadLetterReason.CONFLICTING_DUPLICATE
+    assert (letter.detail, str(letter.event_id)) == (None, EVENT_ID)
     [record] = caplog.records
     assert record.levelno == logging.WARNING
     assert record.getMessage() == (
@@ -209,7 +238,7 @@ def test_empty_polls_keep_the_loop_going_until_stopped() -> None:
     ],
     ids=["not_json", "tombstone", "negative_amount", "bad_currency"],
 )
-def test_invalid_message_is_logged_and_committed_without_touching_the_database(
+def test_invalid_message_is_dead_lettered_logged_and_committed_without_applying(
     raw: bytes | None, reason: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     harness = Harness(FakeMessage(raw, offset_=9, partition_=4))
@@ -217,7 +246,21 @@ def test_invalid_message_is_logged_and_committed_without_touching_the_database(
     with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
         harness.run()
 
-    assert harness.calls == [("commit", 9)]
+    assert harness.calls == [("dead_letter", 9), ("commit", 9)]
+    # Stored as it was read, whatever it is.
+    assert harness.dead_letters == [
+        DeadLetter(
+            topic=TOPIC,
+            partition=4,
+            offset=9,
+            key=KEY,
+            value=raw,
+            received_at_header=format_received_at(RECEIVED_ON_TIME),
+            reason=DeadLetterReason.INVALID_EVENT,
+            detail=reason,
+            event_id=None,
+        )
+    ]
     [record] = caplog.records
     assert record.levelno == logging.WARNING
     assert "partition 4 offset 9" in record.getMessage()
@@ -268,7 +311,7 @@ def test_invalid_message_is_logged_and_committed_without_touching_the_database(
         "repeated",
     ],
 )
-def test_an_event_that_does_not_count_is_logged_and_committed_without_the_database(
+def test_an_event_that_does_not_count_is_dead_lettered_logged_and_committed_without_applying(
     headers: Headers | None, reason: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     harness = Harness(FakeMessage(event_bytes(), offset_=7, partition_=5, headers_=headers))
@@ -276,7 +319,15 @@ def test_an_event_that_does_not_count_is_logged_and_committed_without_the_databa
     with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
         harness.run()
 
-    assert harness.calls == [("commit", 7)]
+    assert harness.calls == [("dead_letter", 7), ("commit", 7)]
+    [letter] = harness.dead_letters
+    # The log's reason is the dead letter's code, then its detail (the delay), if any.
+    code, _, detail = reason.partition(", ")
+    assert (letter.reason.value, letter.detail) == (code, detail or None)
+    assert str(letter.event_id) == EVENT_ID
+    assert (letter.topic, letter.partition, letter.offset) == (TOPIC, 5, 7)
+    assert letter.value == event_bytes()
+    assert letter.received_at_header == received_at_header(headers)
     [record] = caplog.records
     assert record.levelno == logging.WARNING
     assert record.getMessage() == f"event {EVENT_ID} skipped at partition 5 offset 7: {reason}"
@@ -340,13 +391,131 @@ def test_a_skipped_event_does_not_hold_up_the_next() -> None:
     assert harness.calls == [
         ("apply", None),
         ("commit", 1),
+        ("dead_letter", 2),
         ("commit", 2),
         ("apply", None),
         ("commit", 3),
     ]
 
 
+def test_a_dead_letter_already_recorded_is_noted_and_committed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A redelivery after a crash between the dead letter's commit and the offset commit.
+    harness = Harness(FakeMessage(b"{not json", offset_=9, partition_=4))
+    harness.dead_letter_result = lambda letter: False
+
+    with caplog.at_level(logging.INFO, logger="event_pipeline.consumer.loop"):
+        harness.run()
+
+    assert harness.calls == [("dead_letter", 9), ("commit", 9)]
+    assert (
+        "dead letter at partition 4 offset 9 was already recorded at this position: a "
+        "redelivery, or an offset reused after the topic was recreated" in caplog.text
+    )
+
+
 # --- Failures: no commit, the loop raises --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("message", "outcome", "reason"),
+    [
+        (FakeMessage(b"{not json", offset_=9), None, "invalid_event (invalid_json)"),
+        (FakeMessage(event_bytes(), offset_=9, headers_=[]), None, "invalid_received_at"),
+        # The apply has committed (nothing changed), then the dead letter fails: still no commit.
+        (
+            FakeMessage(event_bytes(), offset_=9),
+            ApplyOutcome.CONFLICTING_DUPLICATE,
+            "conflicting_duplicate",
+        ),
+    ],
+    ids=["invalid", "invalid_received_at", "conflicting_duplicate"],
+)
+def test_a_failed_dead_letter_write_stops_the_loop_without_committing(
+    message: FakeMessage,
+    outcome: ApplyOutcome | None,
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = Harness(message)
+    if outcome is not None:
+        harness.apply_result = lambda event: outcome
+
+    def fail(letter: DeadLetter) -> bool:
+        raise RuntimeError("database unavailable")
+
+    harness.dead_letter_result = fail
+
+    with caplog.at_level(logging.WARNING), pytest.raises(ConsumerFailedError):
+        harness.run()
+
+    # The offset stays uncommitted, so the message is redelivered; nothing says it was skipped.
+    expected_calls = (
+        [("dead_letter", 9)] if outcome is None else [("apply", None), ("dead_letter", 9)]
+    )
+    assert harness.calls == expected_calls
+    assert "skipped" not in caplog.text
+    # The stop line keeps why the message was being dead-lettered.
+    assert (
+        stopping_record(caplog)
+        .getMessage()
+        .startswith("consumer stopping: RuntimeError at partition 2 offset 9")
+    )
+    assert (
+        stopping_record(caplog).getMessage().endswith(f"; it was being dead-lettered as {reason}")
+    )
+
+
+def test_an_offset_commit_failing_after_a_stored_dead_letter_does_not_blame_the_dead_letter(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = Harness(FakeMessage(b"{not json", offset_=9))
+    harness.consumer.commit_raises = KafkaException(KafkaError(KafkaError._TRANSPORT))
+
+    with caplog.at_level(logging.ERROR):
+        run_until_failure(harness)
+
+    assert harness.calls == [("dead_letter", 9), ("commit", 9)]
+    message = stopping_record(caplog).getMessage()
+    assert "_TRANSPORT" in message
+    assert "dead-lettered as" not in message
+
+
+def test_a_database_error_writing_a_dead_letter_is_logged_without_the_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The dead letter's INSERT carries the message bytes; PostgreSQL's DETAIL would repeat them.
+    harness = Harness(FakeMessage(b'{"order": "' + PAYLOAD_MARKER.encode() + b'"', offset_=9))
+    error = IntegrityError(
+        "INSERT INTO dead_letters ...",
+        {"message_value": PAYLOAD_MARKER},
+        FakeDriverError(f"DETAIL: ({PAYLOAD_MARKER})"),
+    )
+
+    def fail(letter: DeadLetter) -> bool:
+        raise error
+
+    harness.dead_letter_result = fail
+
+    with caplog.at_level(logging.WARNING):
+        assert run_until_failure(harness) is error
+
+    assert harness.calls == [("dead_letter", 9)]
+    assert "sqlstate=23514" in stopping_record(caplog).getMessage()
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+def test_a_bug_reading_the_headers_of_an_invalid_message_stops_the_loop() -> None:
+    # The headers are kept with every dead letter, so a malformed header item stops the loop on an
+    # invalid message too, instead of storing it without them.
+    malformed: Any = [(RECEIVED_AT_HEADER, b"x", "extra")]
+    harness = Harness(FakeMessage(b"{not json", offset_=7, headers_=malformed))
+
+    with pytest.raises(ConsumerFailedError):
+        harness.run()
+
+    assert harness.calls == []
 
 
 def run_until_failure(harness: "Harness") -> BaseException:

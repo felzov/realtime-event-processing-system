@@ -109,6 +109,30 @@ class _StubEngine:
     def dispose(self) -> None: ...
 
 
+def test_main_writes_dead_letters_through_the_service_on_its_engine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # no .env
+    engine = _StubEngine()
+    seen: dict[str, Any] = {}
+    stored: list[tuple[object, object]] = []
+    monkeypatch.setattr(consumer_main, "Consumer", _StubConsumer)
+    monkeypatch.setattr(consumer_main, "make_engine", lambda settings: engine)
+    monkeypatch.setattr(consumer_main, "_stop_on_signals", lambda stop, watchdog: None)
+    monkeypatch.setattr(consumer_main, "run", lambda *args, **kwargs: seen.update(kwargs))
+
+    def store(on: object, letter: object) -> bool:
+        stored.append((on, letter))
+        return True
+
+    monkeypatch.setattr(consumer_main, "store_dead_letter", store)
+
+    assert consumer_main.main() == 0
+    letter = object()
+    assert seen["dead_letter"](letter) is True
+    assert stored == [(engine, letter)]
+
+
 def test_main_runs_the_loop_with_the_configured_lateness_policy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

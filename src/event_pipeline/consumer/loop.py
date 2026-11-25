@@ -3,15 +3,21 @@
 For each message:
 
 1. A broker error delivered as a message stops the loop (decision 6).
-2. A value that is not a valid event is logged with its reason codes, partition and offset, never
-   its content, and its offset is committed (decision 7, interim until the dead-letter path).
+2. A value that is not a valid event is written to the dead-letter table with its reason codes
+   (ADR 0006), then logged with them, its partition and offset, never its content, and its offset
+   is committed. Its headers are read too, for the dead letter, so a malformed header item stops
+   the loop here as it does for a valid event.
 3. A valid event whose `received_at` header is missing or malformed, or that is late or from the
-   future (ADR 0005), is logged with its reason code, event id, partition and offset, never its
-   content, and its offset is committed without touching the database (ADR 0005, decisions 3-5).
+   future (ADR 0005), is dead-lettered the same way, with its event id, and never applied.
 4. Any other valid event is applied in one database transaction; then its offset + 1 is committed
    synchronously (decisions 1 and 3). A duplicate is committed the same way; a conflicting
-   duplicate (its event_id already counted with different content, decision 13) is also logged,
-   with its event id, partition and offset, never its content.
+   duplicate (its event_id already counted with different content, decision 13) is also
+   dead-lettered and logged.
+
+A dead letter is written in its own committed transaction before the offset commit, as an applied
+event is (ADR 0006, decision 2). If writing it fails, the loop stops without committing the offset,
+like any database error, and the message is redelivered after a restart; a redelivered message is
+not dead-lettered twice.
 
 A commit refused because the consumer's group membership changed under it (a rebalance, or an
 eviction) is logged at WARNING and the loop carries on (decision 10): the event's effect is already
@@ -39,6 +45,7 @@ from sqlalchemy.exc import DBAPIError
 
 from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, parse_received_at
 from event_pipeline.data.errors import describe_database_error
+from event_pipeline.domain.dead_letters import DeadLetter, DeadLetterReason
 from event_pipeline.domain.errors import EventRejectedError, ReasonCode
 from event_pipeline.domain.events import OrderPlacedEvent, parse_event
 from event_pipeline.domain.lateness import LatenessPolicy, Timing, classify
@@ -55,6 +62,8 @@ class Message(Protocol):
     """What the loop reads from a `confluent_kafka.Message`."""
 
     def error(self) -> KafkaError | None: ...
+    def topic(self) -> str | None: ...
+    def key(self) -> bytes | None: ...
     def value(self) -> bytes | None: ...
     def partition(self) -> int | None: ...
     def offset(self) -> int | None: ...
@@ -96,6 +105,10 @@ class OffsetCommitError(Exception):
     """The broker did not confirm that it stored the offset of the committed message."""
 
 
+# Writes one dead letter in its own committed transaction; False if its position was already there.
+type RecordDeadLetter = Callable[[DeadLetter], bool]
+
+
 class ConsumerFailedError(Exception):
     """The loop stopped on a failure and has logged it; the cause is `__cause__`."""
 
@@ -107,12 +120,16 @@ class _Position:
     partition: int | None = None
     offset: int | None = None
     event_id: UUID | None = None
+    # Set only while its dead letter is written: if that fails, the stop line says why it was being
+    # kept. Cleared once it is stored, so a later failure (the offset commit) is not blamed on it.
+    dead_letter_reason: str | None = None
 
 
 def run[M: Message](
     consumer: MessageSource[M],
     apply: Callable[[OrderPlacedEvent], ApplyOutcome],
     *,
+    dead_letter: RecordDeadLetter,
     stop: threading.Event,
     poll_timeout_s: float,
     lateness: LatenessPolicy,
@@ -129,18 +146,21 @@ def run[M: Message](
             if message is None:
                 continue
             position.partition, position.offset = message.partition(), message.offset()
-            _process(consumer, apply, lateness, message, position)
+            _process(consumer, apply, dead_letter, lateness, message, position)
         except Exception as exc:
             # No exc_info: the traceback would print str(exc), which for a database error carries
             # the event's values (PostgreSQL's DETAIL repeats the failing row).
             logger.error(
                 "consumer stopping: %s at partition %s offset %s event %s (%s); "
-                "offset commit not confirmed",
+                "offset commit not confirmed%s",
                 describe_error(exc),
                 position.partition,
                 position.offset,
                 position.event_id,
                 raised_at(exc),
+                ""
+                if position.dead_letter_reason is None
+                else f"; it was being dead-lettered as {position.dead_letter_reason}",
             )
             raise ConsumerFailedError from exc
 
@@ -148,6 +168,7 @@ def run[M: Message](
 def _process[M: Message](
     consumer: MessageSource[M],
     apply: Callable[[OrderPlacedEvent], ApplyOutcome],
+    dead_letter: RecordDeadLetter,
     lateness: LatenessPolicy,
     message: M,
     position: _Position,
@@ -159,22 +180,29 @@ def _process[M: Message](
     try:
         event = parse_event(message.value() or b"")
     except EventRejectedError as rejected:
+        codes = ", ".join(sorted({violation.code.value for violation in rejected.violations}))
+        _dead_letter(
+            dead_letter, message, position, DeadLetterReason.INVALID_EVENT, codes, event_id=None
+        )
         logger.warning(
             "invalid message skipped at partition %s offset %s: %s",
             message.partition(),
             message.offset(),
-            ", ".join(sorted({violation.code.value for violation in rejected.violations})),
+            codes,
         )
     else:
         position.event_id = event.event_id
         skipped = _not_counted_because(event, message.headers(), lateness)
         if skipped is not None:
+            reason, detail = skipped
+            described = reason.value if detail is None else f"{reason.value}, {detail}"
+            _dead_letter(dead_letter, message, position, reason, detail, event_id=event.event_id)
             logger.warning(
                 "event %s skipped at partition %s offset %s: %s",
                 event.event_id,
                 message.partition(),
                 message.offset(),
-                skipped,
+                described,
             )
         else:
             outcome = apply(event)
@@ -184,6 +212,14 @@ def _process[M: Message](
                 case ApplyOutcome.APPLIED | ApplyOutcome.DUPLICATE:
                     pass
                 case ApplyOutcome.CONFLICTING_DUPLICATE:
+                    _dead_letter(
+                        dead_letter,
+                        message,
+                        position,
+                        DeadLetterReason.CONFLICTING_DUPLICATE,
+                        None,
+                        event_id=event.event_id,
+                    )
                     logger.warning(
                         "event %s skipped at partition %s offset %s: %s, its event_id was already "
                         "counted with different content",
@@ -205,23 +241,67 @@ def _process[M: Message](
     _commit(consumer, message, position)
 
 
+def _dead_letter[M: Message](
+    record: RecordDeadLetter,
+    message: M,
+    position: _Position,
+    reason: DeadLetterReason,
+    detail: str | None,
+    *,
+    event_id: UUID | None,
+) -> None:
+    """Write `message` to the dead-letter table as it was read (ADR 0006, decisions 2 and 3).
+
+    Key and value are kept byte for byte. Of the headers only `received_at` is kept, and only when
+    there is exactly one with a bytes value, as `received_at_header` reads it: a repeated header is
+    stored as none. Keeping one copy would let a replay turn a message with two headers, which never
+    counts, into one that does.
+    """
+    position.dead_letter_reason = reason.value if detail is None else f"{reason.value} ({detail})"
+    topic, partition, offset = message.topic(), message.partition(), message.offset()
+    if topic is None or partition is None or offset is None:
+        # Only an error message lacks them, and the loop stops on those before reaching here.
+        raise ValueError("a consumed message without a topic, partition or offset")
+    new = record(
+        DeadLetter(
+            topic=topic,
+            partition=partition,
+            offset=offset,
+            key=message.key(),
+            value=message.value(),
+            received_at_header=received_at_header(message.headers()),
+            reason=reason,
+            detail=detail,
+            event_id=event_id,
+        )
+    )
+    position.dead_letter_reason = None
+    if not new:
+        logger.info(
+            "dead letter at partition %s offset %s was already recorded at this position: a "
+            "redelivery, or an offset reused after the topic was recreated",
+            partition,
+            offset,
+        )
+
+
 def _not_counted_because(
     event: OrderPlacedEvent, headers: Headers | None, lateness: LatenessPolicy
-) -> str | None:
-    """None if `event` counts; otherwise its reason code and, for timing, by how much (ADR 0005)."""
+) -> tuple[DeadLetterReason, str | None] | None:
+    """None if `event` counts; otherwise its reason and, for timing, by how much (ADR 0005)."""
     value = received_at_header(headers)
     try:
         received_at = parse_received_at(value)
     except ValueError:
         # Only the header's value is bad input. An error while finding it (headers shaped other
         # than confluent-kafka documents) is a bug: it stops the loop like any other.
-        return ReasonCode.INVALID_RECEIVED_AT.value
+        return DeadLetterReason.INVALID_RECEIVED_AT, None
     timing = classify(event.occurred_at, received_at, lateness)
     delay_s = (received_at - event.occurred_at).total_seconds()
     if timing is Timing.LATE:
-        return f"{ReasonCode.LATE_EVENT.value}, received {delay_s:.3f} s after occurred_at"
+        return DeadLetterReason.LATE_EVENT, f"received {delay_s:.3f} s after occurred_at"
     if timing is Timing.FUTURE:
-        return f"{ReasonCode.FUTURE_EVENT.value}, received {-delay_s:.3f} s before occurred_at"
+        return DeadLetterReason.FUTURE_EVENT, f"received {-delay_s:.3f} s before occurred_at"
     return None
 
 

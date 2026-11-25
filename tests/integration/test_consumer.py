@@ -29,10 +29,12 @@ from event_pipeline.broker.topics import TopicSpec, ensure_topic
 from event_pipeline.config import Settings
 from event_pipeline.consumer.__main__ import subscribe
 from event_pipeline.consumer.loop import CommittedPartition, Headers, run
-from event_pipeline.data.tables import order_aggregates, processed_events
+from event_pipeline.data.tables import dead_letters, order_aggregates, processed_events
+from event_pipeline.domain.dead_letters import DeadLetter
 from event_pipeline.domain.events import OrderPlacedEvent
 from event_pipeline.domain.windows import window_start
 from event_pipeline.services.aggregation import ApplyOutcome, apply_order_placed
+from event_pipeline.services.dead_letters import store_dead_letter
 from tests.api.helpers import make_app
 from tests.integration.test_ingest_api import post_event
 from tests.samples import encode, valid_event
@@ -199,6 +201,28 @@ def counts(engine: Engine, store_id: str) -> list[tuple[str, int, int]]:
         return [tuple(row) for row in connection.execute(query)]
 
 
+def dead_lettered(engine: Engine, topic: str) -> list[tuple[int, str, str | None, str | None]]:
+    """(offset, reason, detail, event_id) of every dead letter read from `topic`, by offset.
+
+    Each test has its own topic, so this sees only that test's dead letters.
+    """
+    query = (
+        select(
+            dead_letters.c.source_offset,
+            dead_letters.c.reason_code,
+            dead_letters.c.detail,
+            dead_letters.c.event_id,
+        )
+        .where(dead_letters.c.source_topic == topic)
+        .order_by(dead_letters.c.source_partition, dead_letters.c.source_offset)
+    )
+    with engine.connect() as connection:
+        return [
+            (row.source_offset, row.reason_code, row.detail, row.event_id and str(row.event_id))
+            for row in connection.execute(query)
+        ]
+
+
 def wait_for(
     condition: Callable[[], bool], what: str, *, watching: "Sequence[RunningConsumer]" = ()
 ) -> None:
@@ -236,11 +260,15 @@ class RunningConsumer:
             self.outcomes.append(outcome)
             return outcome
 
+        def dead_letter(letter: DeadLetter) -> bool:
+            return store_dead_letter(engine, letter)
+
         def target() -> None:
             try:
                 run(
                     wrap(self.consumer),
                     apply,
+                    dead_letter=dead_letter,
                     stop=self.stop_flag,
                     poll_timeout_s=settings.consumer_poll_timeout_s,
                     lateness=settings.lateness_policy(),
@@ -347,6 +375,17 @@ def test_invalid_message_is_skipped_and_its_offset_committed(
     [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert "invalid_json" in warning.getMessage()
     assert PAYLOAD_MARKER not in caplog.text
+    # Kept as it was read, with its key and the received_at header the producer set.
+    assert dead_lettered(migrated_engine, settings.events_topic) == [
+        (0, "invalid_event", "invalid_json", None)
+    ]
+    with migrated_engine.connect() as connection:
+        row = connection.execute(
+            select(dead_letters).where(dead_letters.c.source_topic == settings.events_topic)
+        ).one()
+    assert row.message_value == b'{"payload": "' + PAYLOAD_MARKER.encode() + b'"'
+    assert row.message_key == store_id.encode()
+    assert row.received_at_header == format_received_at(RECEIVED_AT)
 
 
 def test_a_reused_event_id_with_other_content_is_logged_and_not_counted(
@@ -387,6 +426,10 @@ def test_a_reused_event_id_with_other_content_is_logged_and_not_counted(
     assert " offset 1: conflicting_duplicate," in warning
     assert PAYLOAD_MARKER not in caplog.text
     assert store_id not in caplog.text
+    # The second copy is kept for inspection; the first stays counted.
+    assert dead_lettered(migrated_engine, settings.events_topic) == [
+        (1, "conflicting_duplicate", None, first["event_id"])
+    ]
 
 
 # --- Late, future and unreadable received_at (ADR 0005) -----------------------------------------
@@ -436,6 +479,24 @@ def test_events_that_do_not_count_are_skipped_without_blocking_and_replay_the_sa
         "invalid_received_at",
     ]
     assert PAYLOAD_MARKER not in caplog.text
+    expected_dead_letters = [
+        (1, "late_event", "received 600.000 s after occurred_at", late["event_id"]),
+        (2, "future_event", "received 120.000 s before occurred_at", future["event_id"]),
+        (3, "invalid_received_at", None, unstamped["event_id"]),
+    ]
+    assert dead_lettered(migrated_engine, settings.events_topic) == expected_dead_letters
+    # Byte for byte, with the received_at each was stamped with: a replay sends these (ADR 0006).
+    with migrated_engine.connect() as connection:
+        rows = connection.execute(
+            select(dead_letters.c.message_value, dead_letters.c.received_at_header)
+            .where(dead_letters.c.source_topic == settings.events_topic)
+            .order_by(dead_letters.c.source_offset)
+        ).all()
+    assert [tuple(row) for row in rows] == [
+        (encode(late), format_received_at(occurred + timedelta(minutes=10))),
+        (encode(future), format_received_at(occurred - timedelta(minutes=2))),
+        (encode(unstamped), None),
+    ]
 
     # A replay (a new group reads the topic from the start) classifies every message the same way:
     # the two on-time events are duplicates now, and the other three are skipped again.
@@ -452,6 +513,8 @@ def test_events_that_do_not_count_are_skipped_without_blocking_and_replay_the_sa
     assert replay.error is None
     assert counts(migrated_engine, store_id) == [("EUR", 2, 10_001)]
     assert [o.value for o in replay.outcomes] == ["duplicate", "duplicate"]
+    # The same positions: no second dead letter for any of them.
+    assert dead_lettered(migrated_engine, settings.events_topic) == expected_dead_letters
 
 
 # --- Crash point B: database committed, offset not ------------------------------------------------
@@ -646,6 +709,48 @@ def test_restart_after_crash_point_a_applies_the_event_exactly_once(
     assert restarted.outcomes == [ApplyOutcome.APPLIED] * 3
     assert recorded(migrated_engine, *bodies) == 3
     assert counts(migrated_engine, store_id) == [("EUR", 3, 600)]
+
+
+def test_a_dead_letter_that_fails_to_commit_stops_the_consumer_and_is_written_on_restart(
+    settings: Settings, migrated_engine: Engine, running: list[RunningConsumer]
+) -> None:
+    # The invalid message comes first, so the engine's first COMMIT is its dead letter's.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    produce(
+        settings,
+        b"{not json",
+        encode(event_body(store_id, amount_minor=700)),
+        key=store_id.encode(),
+    )
+
+    fail_next_commit(migrated_engine)
+    crashed = RunningConsumer(settings, migrated_engine)
+    running.append(crashed)
+    crashed.thread.join(TIMEOUT_S)
+    crashed.stop()
+
+    assert crashed.error is not None
+    assert isinstance(crashed.error.__cause__, SimulatedCrashError)
+    # Neither the dead letter nor the offset: the message is not lost, it will be read again.
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+    assert committed_offsets(settings) == {}
+    assert crashed.outcomes == []
+
+    restarted = RunningConsumer(settings, migrated_engine)
+    running.append(restarted)
+    wait_for(
+        lambda: committed_offsets(settings) == end_offsets(settings),
+        "every offset committed",
+        watching=[restarted],
+    )
+    restarted.stop()
+
+    assert restarted.error is None
+    assert dead_lettered(migrated_engine, settings.events_topic) == [
+        (0, "invalid_event", "invalid_json", None)
+    ]
+    assert restarted.outcomes == [ApplyOutcome.APPLIED]
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 700)]
 
 
 def test_a_new_group_rereads_the_topic_and_changes_no_aggregate(
