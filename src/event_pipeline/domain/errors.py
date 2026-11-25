@@ -25,6 +25,9 @@ class ReasonCode(StrEnum):
     LATE_EVENT = "late_event"
     FUTURE_EVENT = "future_event"
     INVALID_RECEIVED_AT = "invalid_received_at"
+    # A valid event whose event_id was already counted with different content (ADR 0004,
+    # decision 13): the first applied copy stays counted, this one is not.
+    CONFLICTING_DUPLICATE = "conflicting_duplicate"
 
 
 ROOT_PATH = "<body>"
