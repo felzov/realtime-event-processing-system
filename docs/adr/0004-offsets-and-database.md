@@ -122,11 +122,12 @@ seconds later.
     stores a SHA-256 of the parsed event as canonical JSON (instants normalised to UTC;
     `received_at` is a header and not part of it). On a conflict the stored hash is compared: a
     different hash is logged at WARNING as `conflicting_duplicate` with the `event_id`, partition
-    and offset, never values; the first copy stays counted, and the offset is committed as for any
-    duplicate. Rows stored before the column existed have no hash and are treated as plain
-    duplicates. The hash covers the parsed `schema_version` 1 fields, so a future version 2 copy
-    of the same event would hash differently and be reported as a conflict. Phase 5, slice 4
-    builds it, with a migration.
+    and offset, never values; the first applied copy stays counted, and the offset is committed as
+    for any duplicate. "First applied": a copy skipped as late, future or invalid is not recorded,
+    and across partitions "first" is the first to commit. Rows stored before the column existed
+    have no hash and are treated as plain duplicates. The hash covers the parsed `schema_version` 1
+    fields, so a future version 2 copy of the same event would hash differently and be reported as
+    a conflict. Phase 5, slice 4 builds it, with a migration.
 
 Why a stale or failed commit cannot lose or double-count an event: a consumer commits an offset
 only after it has handled that message itself (applied it, or skipped it under decision 7 or
