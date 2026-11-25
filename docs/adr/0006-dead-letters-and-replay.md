@@ -118,7 +118,9 @@ slice 4. Until then the consumer behaves as ADR 0004 and ADR 0005 describe.
 - **A recreated topic restarts its offsets.** A new message at a position already in
   `dead_letters` would conflict with the old row and not be recorded. Recreating the topic is not a
   supported operation (`TopicMismatchError` already refuses a changed one).
-- **Headers other than `received_at` are dropped**, on dead-lettering and therefore on replay.
+- **Headers other than `received_at` are dropped**, on dead-lettering and therefore on replay. A
+  `received_at` header that is repeated, or whose value is not bytes, is stored as none: a replay
+  then sends no header, and the message is `invalid_received_at` again, as it was.
 - **Rebuilding all aggregates from the topic is possible only within its 7-day retention**, and it
   is a documented manual procedure with destructive steps, not a script.
 - **Retrying in place lengthens the worst case per event**, so the minimum

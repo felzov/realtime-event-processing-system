@@ -26,7 +26,8 @@ Phases 1 (event contract), 2 (ingest), 3 (consumer and durable aggregate), 4 (la
   logged as `conflicting_duplicate` and not counted (ADR 0004, phase 5 update).
 - `GET /stores/{store_id}/aggregates` reads the aggregates from PostgreSQL.
 
-The dead-letter path and failure tests come in later phases; the
+Messages that are not counted are kept in a `dead_letters` table (ADR 0006); database-rejected
+events, retries, replay and the failure tests come in later slices and phases; the
 [component table](docs/architecture.md#components) has the build order. This is a learning project,
 not a production service.
 
@@ -68,8 +69,8 @@ from `make db-revision ID=0004 NAME="what it does"`, and `EXPECTED_REVISION` in
 
 After pulling a change that adds a migration, run `make db-migrate` before starting the API or the
 consumer. Until then `/ready` answers `migration_mismatch`, and the consumer stops on the first
-event it applies (late, future and invalid messages are still skipped before that); nothing is
-lost, and that event is redelivered when the consumer is restarted after the migration. When
+message that needs what the migration adds (for 0003, the first message it dead-letters); nothing
+is lost, and that message is redelivered when the consumer is restarted after the migration. When
 deploying, migrate first, then replace the code: `/ready` checks for exactly the revision the code
 expects, so API processes still running the old code answer `migration_mismatch` until they are
 replaced, while their ingest and query paths, and an old consumer, keep working.
@@ -152,9 +153,11 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
   values). A refused connection, a wrong password and a missing database therefore all log the
   same line, `OperationalError OperationalError`, and answer `503`: the log does not tell a
   misconfiguration from an outage.
-- Late events, events from the future and messages without a valid `received_at` header are
-  skipped with a WARNING (reason code, `event_id`, partition, offset): until the dead-letter path
-  (phase 6) they exist only in the topic and that log line. `ALLOWED_LATENESS_S` (300 s) and
+- Invalid messages, late events, events from the future, messages without a valid `received_at`
+  header and conflicting duplicates are written to the `dead_letters` table (the message as it was
+  read, a reason code and a detail without values) before their offset is committed, and logged
+  with a WARNING (ADR 0006). Only the `received_at` header is kept. Nothing deletes dead letters,
+  and there is no API to read them: it takes a SQL query. `ALLOWED_LATENESS_S` (300 s) and
   `MAX_FUTURE_SKEW_S` (60 s) are assumptions, not measured delays.
 - A replay classifies old messages under the limits in force at the time. Into the same database it
   can only add: raising the limits and replaying counts events skipped before, but lowering them
@@ -164,9 +167,9 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
   changes once ingest time passes `W_end + ALLOWED_LATENESS_S` and the consumer has caught up.
 - The consumer trusts the `received_at` header: anyone who can write to the topic can set it.
 - An event the database rejects permanently (for example, revenue past the 64-bit limit) stops the
-  consumer each time it is redelivered, which blocks its partition until the dead-letter path
-  (phase 6). An invalid message on the topic is logged and skipped: it is lost apart from the log
-  line.
+  consumer each time it is redelivered, which blocks its partition until phase 6, slice 3
+  dead-letters it. So does any other database error, including one while writing a dead letter:
+  the offset is not committed, and a restart reads the message again.
 - An offset commit refused because the group's membership changed (a rebalance or an eviction:
   `ILLEGAL_GENERATION`, `UNKNOWN_MEMBER_ID`, `REBALANCE_IN_PROGRESS`) is logged as a WARNING and the
   consumer goes on; the event may be redelivered and is then counted as a duplicate (ADR 0004,
