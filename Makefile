@@ -1,7 +1,7 @@
 .RECIPEPREFIX = >
 
 .PHONY: install lint format typecheck test test-integration check check-all up down topics run \
-	db-migrate db-revision consumer
+	db-migrate db-revision consumer replay
 
 # The broker from `make up`. Override for another broker; a direct `pytest -m integration` run
 # without it fails instead of skipping.
@@ -61,6 +61,11 @@ run:
 # event.
 consumer:
 > uv run --locked python -m event_pipeline.consumer
+
+# Lists the dead letters a replay would publish to the events topic; nothing is published without
+# --execute (ADR 0006), e.g. `make replay ARGS="--reason late_event --execute"`.
+replay:
+> uv run --locked python -m event_pipeline.replay $(ARGS)
 
 # Migrates the database in DATABASE_URL (default: the local development database) to the latest
 # revision.
