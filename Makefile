@@ -1,7 +1,7 @@
 .RECIPEPREFIX = >
 
 .PHONY: install lint format typecheck test test-integration check check-all up down topics run \
-	db-migrate db-revision consumer
+	db-migrate db-revision consumer replay
 
 # The broker from `make up`. Override for another broker; a direct `pytest -m integration` run
 # without it fails instead of skipping.
@@ -62,13 +62,18 @@ run:
 consumer:
 > uv run --locked python -m event_pipeline.consumer
 
+# Lists the dead letters a replay would publish to the events topic; nothing is published without
+# --execute (ADR 0006), e.g. `make replay ARGS="--reason late_event --execute"`.
+replay:
+> uv run --locked python -m event_pipeline.replay $(ARGS)
+
 # Migrates the database in DATABASE_URL (default: the local development database) to the latest
 # revision.
 db-migrate:
 > uv run --locked alembic upgrade head
 
-# A new, empty migration to write by hand, e.g. `make db-revision ID=0002 NAME="add an index"`.
+# A new, empty migration to write by hand, e.g. `make db-revision ID=0004 NAME="add an index"`.
 # Then update EXPECTED_REVISION in src/event_pipeline/data/tables.py.
 db-revision:
-> @test -n "$(ID)" && test -n "$(NAME)" || { echo 'usage: make db-revision ID=0002 NAME="what it does"' >&2; exit 2; }
+> @test -n "$(ID)" && test -n "$(NAME)" || { echo 'usage: make db-revision ID=0004 NAME="what it does"' >&2; exit 2; }
 > uv run --locked alembic revision --rev-id "$(ID)" -m "$(NAME)"

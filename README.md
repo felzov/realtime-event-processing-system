@@ -26,8 +26,11 @@ Phases 1 (event contract), 2 (ingest), 3 (consumer and durable aggregate), 4 (la
   logged as `conflicting_duplicate` and not counted (ADR 0004, phase 5 update).
 - `GET /stores/{store_id}/aggregates` reads the aggregates from PostgreSQL.
 
-The dead-letter path and failure tests come in later phases; the
-[component table](docs/architecture.md#components) has the build order. This is a learning project,
+Messages that are not counted, including events the database rejects, are kept in a `dead_letters`
+table, a transient database error is retried a few times before the consumer stops, and
+`make replay` publishes dead letters to the topic again (phase 6, ADR 0006). The failure tests in
+combination come in phase 7; the [component table](docs/architecture.md#components) has the build
+order. This is a learning project,
 not a production service.
 
 - [Architecture](docs/architecture.md): target design, data flow, crash points, build order
@@ -63,16 +66,20 @@ is created only when the data volume is new (`docker/postgres-init/`). The passw
 The schema comes from hand-written Alembic migrations in `migrations/`, each with a working
 downgrade. `make db-migrate` applies them to the database in `DATABASE_URL`; the integration tests
 migrate the test database themselves, down to an empty schema and back up. A new migration starts
-from `make db-revision ID=0003 NAME="what it does"`, and `EXPECTED_REVISION` in
+from `make db-revision ID=0004 NAME="what it does"`, and `EXPECTED_REVISION` in
 `src/event_pipeline/data/tables.py` must name the new head (a unit test checks it).
 
 After pulling a change that adds a migration, run `make db-migrate` before starting the API or the
-consumer. Until then `/ready` answers `migration_mismatch`, and the consumer stops on the first
-event it applies (late, future and invalid messages are still skipped before that); nothing is
-lost, and that event is redelivered when the consumer is restarted after the migration. When
-deploying, migrate first, then replace the code: `/ready` checks for exactly the revision the code
-expects, so API processes still running the old code answer `migration_mismatch` until they are
-replaced, while their ingest and query paths, and an old consumer, keep working.
+consumer. Until then `/ready` answers `migration_mismatch`, and the consumer stops, after
+`DB_APPLY_ATTEMPTS` attempts, on the first message that needs what the migration adds (for 0003,
+the first message it dead-letters); nothing is lost, and that message is redelivered when the
+consumer is restarted after the migration. When deploying, migrate first, then replace the code:
+`/ready` checks for exactly the revision the code expects, so API processes still running the old
+code answer `migration_mismatch` until they are replaced, while their ingest and query paths, and
+an old consumer, keep working. A migration must therefore never add a constraint the running code
+can violate (a `NOT NULL` column without a default, a stricter `CHECK`): the old consumer would
+get a class `23` error on every event and dead-letter them all as `database_rejected` instead of
+stopping. They are kept, not lost, and can be replayed once the new code runs.
 
 Integration tests create their own `test.<id>` topics and do not delete them; they stay in the
 Kafka data volume until it is removed.
@@ -134,6 +141,44 @@ once, without the error's message; the failed event is redelivered on restart), 
 takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run that command, not
 `make`: `make` reports its own status when it receives a signal.
 
+### Replaying dead letters
+
+`make replay` (`uv run python -m event_pipeline.replay`) lists the dead letters read from
+`EVENTS_TOPIC` that it would publish again, and publishes nothing. Add `--execute` to publish them:
+each one's key, value and original `received_at` header go back to the topic, and the command waits
+for the broker to confirm each one (ADR 0006, decision 7). The consumer then handles every copy like
+any other message, so the replay changes no table itself.
+
+```sh
+make replay                                              # everything replayable, dry run
+make replay ARGS="--reason late_event"                   # one reason (repeatable)
+make replay ARGS="--event-id <uuid> --execute"           # one event, published
+make replay ARGS="--since 2026-11-25T10:00:00Z --until 2026-11-25T11:00:00Z"
+```
+
+`--since` and `--until` select by when a message was dead-lettered, as `[since, until)`, and need a
+UTC offset (`Z`). The output shows positions, reasons, event ids and counts, never a key or a value.
+Exit status: `0` when everything selected was published (or only listed); `1` when the broker did
+not confirm a message or the database could not be read; `2` for invalid arguments. Running the
+same replay again is safe: an event already counted is a duplicate the second time.
+
+A replayed message that still fails is dead-lettered again at its new offset, and the old row stays.
+Of the dead letters of one message (the same event id, key and value bytes, or for an
+`invalid_event` the same key and value) a replay therefore publishes only the newest, and reports
+how many older ones it left out; each run adds at most one dead letter per message that fails
+again. Copies of one event with different content are each published. To leave out what an
+earlier replay added, pass `--until` with the time that replay ran.
+
+What to do per reason (`detail` says more, without values):
+
+| `reason_code` | Cause | Replay |
+|---------------|-------|--------|
+| `late_event`, `future_event` | Received too long after, or before, `occurred_at` | Raise `ALLOWED_LATENESS_S` or `MAX_FUTURE_SKEW_S`, restart the consumer, then replay. Under the same limits it is dead-lettered again. |
+| `database_rejected` | PostgreSQL refused the values (SQLSTATE class `22`/`23` and constraint in `detail`), or a migration ahead of the code | Fix the cause (code or migration), then replay. |
+| `invalid_event` | The value broke the contract (violation codes in `detail`) | Fix the sender. A replay fails the same way unless the contract code changed. |
+| `invalid_received_at` | No valid `received_at` header: written by something other than the ingest API | Send it through `POST /events`. A replay sends the header as stored and fails again. |
+| `conflicting_duplicate` | An `event_id` reused for different content; the first copy is counted | Refused: replaying would only conflict again. Ask the sender. |
+
 ### Limitations
 
 - No authentication or rate limiting, and the broker and database connections are plaintext:
@@ -152,9 +197,11 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
   values). A refused connection, a wrong password and a missing database therefore all log the
   same line, `OperationalError OperationalError`, and answer `503`: the log does not tell a
   misconfiguration from an outage.
-- Late events, events from the future and messages without a valid `received_at` header are
-  skipped with a WARNING (reason code, `event_id`, partition, offset): until the dead-letter path
-  (phase 6) they exist only in the topic and that log line. `ALLOWED_LATENESS_S` (300 s) and
+- Invalid messages, late events, events from the future, messages without a valid `received_at`
+  header and conflicting duplicates are written to the `dead_letters` table (the message as it was
+  read, a reason code and a detail without values) before their offset is committed, and logged
+  with a WARNING (ADR 0006). Only the `received_at` header is kept. Nothing deletes dead letters,
+  and there is no API to read them: it takes a SQL query. `ALLOWED_LATENESS_S` (300 s) and
   `MAX_FUTURE_SKEW_S` (60 s) are assumptions, not measured delays.
 - A replay classifies old messages under the limits in force at the time. Into the same database it
   can only add: raising the limits and replaying counts events skipped before, but lowering them
@@ -163,10 +210,26 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
 - Nothing reports whether a window is final. By ADR 0005 a window ending at `W_end` no longer
   changes once ingest time passes `W_end + ALLOWED_LATENESS_S` and the consumer has caught up.
 - The consumer trusts the `received_at` header: anyone who can write to the topic can set it.
-- An event the database rejects permanently (for example, revenue past the 64-bit limit) stops the
-  consumer each time it is redelivered, which blocks its partition until the dead-letter path
-  (phase 6). An invalid message on the topic is logged and skipped: it is lost apart from the log
-  line.
+- An event the database rejects (SQLSTATE class `22` or `23`, for example revenue past the 64-bit
+  limit) is dead-lettered as `database_rejected`, with the error's classes and SQLSTATE as detail,
+  and the next message on its partition is processed. A class `22` or `23` error caused by a bug in
+  this project's SQL is dead-lettered the same way rather than stopping the consumer.
+- Any other database error (no connection, a timeout, a lock wait cut off by the statement
+  timeout, a missing column before `make db-migrate`) is retried up to `DB_APPLY_ATTEMPTS` times
+  (default 3, pausing 0.5 s, then 1 s, at most 2 s), each failed attempt but the last logged as a
+  WARNING; the last is the ERROR stop line. If
+  every attempt fails, or a stop is requested during a pause, the consumer stops with status `1`
+  without committing the offset, and a restart reads the message again. The same holds for writing
+  a dead letter, except that a class `22` or `23` error there is a bug and stops the consumer at
+  once.
+- With retries, one message can take up to 183 s of database time with the default timeouts (two
+  transactions, each up to three attempts of 30 s, plus the pauses). `CONSUMER_MAX_POLL_INTERVAL_MS`
+  must be at least twice that, so its default is 600 s, not librdkafka's 300 s: a consumer stuck in
+  a bug outside the database is removed from its group only after 10 minutes. While it retries, a
+  consumer does not poll, so a rebalance (a consumer joining or leaving) waits for it, up to that
+  long.
+- An error psycopg raises itself without a SQLSTATE other than a connection error (for example, a
+  value it cannot send) is a bug: the consumer stops at once, without retrying.
 - An offset commit refused because the group's membership changed (a rebalance or an eviction:
   `ILLEGAL_GENERATION`, `UNKNOWN_MEMBER_ID`, `REBALANCE_IN_PROGRESS`) is logged as a WARNING and the
   consumer goes on; the event may be redelivered and is then counted as a duplicate (ADR 0004,
@@ -180,7 +243,17 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
   with `INCONSISTENT_GROUP_PROTOCOL`.
 - Stopping the consumer during an event slower than `CONSUMER_CLOSE_TIMEOUT_S` ends with status `2`
   and that event rolled back; it is redelivered on restart.
-- `processed_events` grows by one row per event and is never pruned yet.
+- `processed_events` grows by one row per event and `dead_letters` by one per message not counted;
+  neither is ever pruned (ADR 0006, decision 8). Deleting old dead letters is a manual `DELETE`.
+- A dead letter is not marked as replayed, so every replay with the same selection publishes it
+  again (harmless once counted: the consumer drops the duplicate). A replay loads every selected
+  dead letter into memory before publishing.
+- Dead letters are keyed by topic, partition and offset. Recreating the topic restarts its offsets,
+  so a new message at a position already in `dead_letters` would not be recorded; recreating the
+  topic is not supported.
+- Rebuilding every aggregate from the topic (emptying `order_aggregates` and `processed_events`,
+  then reading with a new consumer group) works only for the topic's retention, 7 days, and its
+  steps are destructive, so it is not scripted. A replay can only add to the aggregates.
 - An `event_id` reused for different content is only logged (`conflicting_duplicate`, with the
   `event_id`, partition and offset): the first applied copy stays counted and nobody tells the
   sender. "Different" compares the parsed event (`received_at` excluded, `occurred_at` as a UTC

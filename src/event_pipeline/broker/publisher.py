@@ -286,7 +286,7 @@ class EventPublisher:
     ) -> DeliveryCallback:
         def on_delivery(error: KafkaError | None, message: Message) -> None:
             try:
-                outcome = _outcome(error, message)
+                outcome = delivery_outcome(error, message)
             except Exception:
                 # A bug in handling one report. Raising would end the poll thread, and every later
                 # request would fail; this request gets an unconfirmed answer instead.
@@ -302,7 +302,8 @@ class EventPublisher:
         return on_delivery
 
 
-def _outcome(error: KafkaError | None, message: Message) -> Delivery:
+def delivery_outcome(error: KafkaError | None, message: Message) -> Delivery:
+    """What one delivery report says; the replay (services/replay.py) reads its reports with it."""
     if error is not None:
         return classify(error)
     partition, offset = message.partition(), message.offset()

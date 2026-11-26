@@ -29,9 +29,9 @@ from event_pipeline.broker.publisher import (
     EventPublisher,
     NotDelivered,
     PublishFailure,
-    _outcome,
     _resolve,
     classify,
+    delivery_outcome,
     format_received_at,
     log_client_error,
     parse_received_at,
@@ -133,7 +133,7 @@ def test_received_at_in_any_other_form_is_refused(value: bytes | None) -> None:
 def test_successful_report_becomes_delivered() -> None:
     message = Message(topic="t", partition=2, offset=7)
 
-    assert _outcome(None, message) == Delivered(partition=2, offset=7)
+    assert delivery_outcome(None, message) == Delivered(partition=2, offset=7)
 
 
 def test_report_without_an_offset_is_not_called_a_success(
@@ -142,7 +142,7 @@ def test_report_without_an_offset_is_not_called_a_success(
     message = Message(topic="t", partition=2, offset=-1001)
 
     with caplog.at_level(logging.ERROR):
-        outcome = _outcome(None, message)
+        outcome = delivery_outcome(None, message)
 
     assert outcome == NotDelivered(PublishFailure.PUBLISHER_FAILED, CAUSE_NO_OFFSET)
     assert "delivery report without an offset" in caplog.text
@@ -151,7 +151,7 @@ def test_report_without_an_offset_is_not_called_a_success(
 def test_failed_report_is_classified() -> None:
     error = KafkaError(KafkaError._MSG_TIMED_OUT)
 
-    assert _outcome(error, Message(topic="t")) == classify(error)
+    assert delivery_outcome(error, Message(topic="t")) == classify(error)
 
 
 def test_late_report_for_a_finished_request_is_ignored() -> None:

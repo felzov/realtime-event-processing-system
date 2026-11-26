@@ -1,20 +1,24 @@
 """`python -m event_pipeline.consumer` (`make consumer`): run the aggregating consumer.
 
-SIGTERM or SIGINT asks the loop to stop after the current event; a second signal is ignored, the
-close timeout bounds the wait. Exit status:
+SIGTERM or SIGINT asks the loop to stop after the current event, or at once during a pause between
+retries of a database error; a second signal is ignored, the close timeout bounds the wait.
+Exit status:
 
 - 0: stopped on request, every applied event's offset committed, group left;
 - 1: stopped by a failure, which is logged once, without the error's message; the failed event's
-  offset is not committed, so a restart redelivers it;
+  offset is not committed, so a restart redelivers it. A transient database error is a failure
+  only after DB_APPLY_ATTEMPTS attempts, or if a stop is requested while waiting to retry it
+  (ADR 0006, decision 5);
 - 2: did not finish within CONSUMER_CLOSE_TIMEOUT_S of the stop request or of the failure (for
   example, leaving the group with the broker unreachable) and was ended. Safe for the same reason
   as a crash: an event whose offset was not committed is redelivered, and the duplicates table
   absorbs what was applied (ADR 0004).
 
-"The current event" is finished only if it ends within the close timeout. One event's database
-work may legitimately take longer (with the defaults up to 30 s: pool + connect timeouts and four
-statements, config.py), so a stop request during a slow event can end with status 2 and that
-event's transaction rolled back. It is redelivered on restart; nothing is lost or counted twice.
+"The current event" is finished only if it ends within the close timeout. One transaction's
+database work may legitimately take longer (with the defaults up to 30 s: pool + connect timeouts
+and four statements, config.py), so a stop request during a slow event can end with status 2 and
+that event's transaction rolled back. It is redelivered on restart; nothing is lost or counted
+twice. A stop request during a pause between retries ends the pause at once.
 """
 
 import logging
@@ -30,8 +34,10 @@ from event_pipeline.broker.config import consumer_config
 from event_pipeline.config import Settings
 from event_pipeline.consumer.loop import ConsumerFailedError, describe_error, raised_at, run
 from event_pipeline.data.engine import make_engine
+from event_pipeline.domain.dead_letters import DeadLetter
 from event_pipeline.domain.events import OrderPlacedEvent
 from event_pipeline.services.aggregation import ApplyOutcome, apply_order_placed
+from event_pipeline.services.dead_letters import store_dead_letter
 
 logger = logging.getLogger("event_pipeline.consumer")
 
@@ -152,12 +158,17 @@ def main() -> int:
         def apply(event: OrderPlacedEvent) -> ApplyOutcome:
             return apply_order_placed(engine, event)
 
+        def dead_letter(letter: DeadLetter) -> bool:
+            return store_dead_letter(engine, letter)
+
         run(
             consumer,
             apply,
+            dead_letter=dead_letter,
             stop=stop,
             poll_timeout_s=settings.consumer_poll_timeout_s,
             lateness=settings.lateness_policy(),
+            retry=settings.db_retry_policy(),
         )
     except ConsumerFailedError:
         status = EXIT_FAILED  # the loop logged it
@@ -180,11 +191,16 @@ def main() -> int:
 
 def _stop_on_signals(stop: threading.Event, watchdog: CloseWatchdog) -> None:
     def request_stop(signum: int, frame: FrameType | None) -> None:
+        # is_set() reads the flag without the Event's lock. A second signal before the flag is set
+        # starts a second setter, which is harmless.
         if stop.is_set():
             return
         logger.info("%s received; stopping after the current event", signal.Signals(signum).name)
-        stop.set()
         watchdog.arm()
+        # Set from another thread, never here: the handler runs in the main thread between
+        # bytecodes, possibly inside the loop's stop.wait() while that holds the Event's lock (a
+        # plain Lock), and stop.set() takes the same lock, so it would wait for itself forever.
+        threading.Thread(target=stop.set, name="stop-request", daemon=True).start()
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)

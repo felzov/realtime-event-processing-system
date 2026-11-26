@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from event_pipeline.broker.config import consumer_config, producer_config
 from event_pipeline.broker.topics import TopicSpec, events_topic
 from event_pipeline.config import Settings
+from event_pipeline.data.errors import RetryPolicy
 
 
 def make_settings(**overrides: Any) -> Settings:
@@ -74,6 +75,7 @@ def test_backstop_with_2s_margin_is_accepted() -> None:
         {"db_connect_timeout_s": 1},
         {"db_statement_timeout_ms": 0},
         {"db_pool_timeout_s": 0},
+        {"db_apply_attempts": 0},
         {"consumer_group_id": ""},
         {"consumer_poll_timeout_s": 0},
         {"consumer_max_poll_interval_ms": 0},
@@ -94,6 +96,7 @@ def test_backstop_with_2s_margin_is_accepted() -> None:
         "connect_timeout_below_libpq_minimum",
         "zero_statement_timeout",
         "zero_pool_timeout",
+        "zero_apply_attempts",
         "empty_group_id",
         "zero_poll_timeout",
         "zero_max_poll_interval",
@@ -165,7 +168,7 @@ def test_invalid_database_url_is_rejected_without_echoing_it(url: str, message: 
 
 def test_consumer_config_sets_the_adr_0004_offset_policy_and_strategy() -> None:
     config = consumer_config(
-        make_settings(consumer_group_id="aggregator-test", consumer_max_poll_interval_ms=120_000)
+        make_settings(consumer_group_id="aggregator-test", consumer_max_poll_interval_ms=480_000)
     )
 
     assert config == {
@@ -173,28 +176,35 @@ def test_consumer_config_sets_the_adr_0004_offset_policy_and_strategy() -> None:
         "group.id": "aggregator-test",
         "enable.auto.commit": False,
         "auto.offset.reset": "earliest",
-        "max.poll.interval.ms": 120_000,
+        "max.poll.interval.ms": 480_000,
         "partition.assignment.strategy": "cooperative-sticky",
     }
 
 
-# Worst-case database time of one event with these: (5 + 5) s + 4 x 10 s = 50 s; twice is 100 s.
+# Worst-case database time of one message with these: one transaction is (5 + 5) s + 4 x 10 s =
+# 50 s; three attempts and 0.5 + 1 s of pauses make 151.5 s; two transactions 303 s; twice is 606 s.
 LONG_STATEMENTS = {"db_statement_timeout_ms": 10_000}
+# The same with the default timeouts: 30 s per transaction, 2 x (3 x 30 + 1.5) = 183 s; twice is
+# 366 s.
+DEFAULT_FLOOR_MS = 366_000
 
 
 @pytest.mark.parametrize(
     "overrides",
     [
-        {**LONG_STATEMENTS, "consumer_max_poll_interval_ms": 100_000},
-        # librdkafka's lower bound, with timeouts small enough not to matter.
+        {**LONG_STATEMENTS, "consumer_max_poll_interval_ms": 606_000},
+        {"consumer_max_poll_interval_ms": DEFAULT_FLOOR_MS},
+        # librdkafka's lower bound, with timeouts small enough not to matter (one attempt: 2 x 7 s,
+        # twice is 28 s).
         {
             "db_pool_timeout_s": 1.0,
             "db_connect_timeout_s": 2,
             "db_statement_timeout_ms": 1000,
+            "db_apply_attempts": 1,
             "consumer_max_poll_interval_ms": 45_000,
         },
     ],
-    ids=["twice_the_worst_case_apply", "session_timeout"],
+    ids=["twice_the_worst_case_message", "default_timeouts_floor", "session_timeout"],
 )
 def test_accepted_max_poll_interval_makes_a_consumer_librdkafka_accepts(
     overrides: dict[str, Any],
@@ -205,15 +215,38 @@ def test_accepted_max_poll_interval_makes_a_consumer_librdkafka_accepts(
     Consumer(consumer_config(settings)).close()
 
 
-def test_max_poll_interval_must_be_well_over_the_worst_case_apply() -> None:
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {**LONG_STATEMENTS, "consumer_max_poll_interval_ms": 605_999},
+        {"consumer_max_poll_interval_ms": DEFAULT_FLOOR_MS - 1},
+        # One more attempt: 4 x 30 s + 0.5 + 1 + 2 s = 123.5 s per transaction, 494 s floor.
+        {"db_apply_attempts": 4, "consumer_max_poll_interval_ms": 493_999},
+    ],
+    ids=["long_statements", "default_timeouts", "four_attempts"],
+)
+def test_max_poll_interval_must_be_well_over_the_worst_case_message(
+    overrides: dict[str, Any],
+) -> None:
     with pytest.raises(ValidationError, match="consumer_max_poll_interval_ms must be at least 2"):
-        make_settings(**LONG_STATEMENTS, consumer_max_poll_interval_ms=99_999)
+        make_settings(**overrides)
+
+
+def test_four_attempts_fit_at_their_floor() -> None:
+    assert make_settings(db_apply_attempts=4, consumer_max_poll_interval_ms=494_000)
+
+
+def test_the_default_max_poll_interval_covers_the_default_worst_case() -> None:
+    # Phase 6 raised it from 300 s (librdkafka's default), which is below the 366 s floor.
+    assert make_settings().consumer_max_poll_interval_ms == 600_000
+    with pytest.raises(ValidationError, match="consumer_max_poll_interval_ms must be at least 2"):
+        make_settings(consumer_max_poll_interval_ms=300_000)
 
 
 def test_long_statement_timeout_needs_a_longer_max_poll_interval_than_the_default() -> None:
-    # The default max.poll.interval (300 s) against a 40 s statement timeout: 2 x 170 s.
+    # The default max.poll.interval (600 s) against a 10 s statement timeout: 2 x 303 s.
     with pytest.raises(ValidationError, match="consumer_max_poll_interval_ms must be at least 2"):
-        make_settings(db_statement_timeout_ms=40_000)
+        make_settings(**LONG_STATEMENTS)
 
 
 def test_max_poll_interval_below_the_session_timeout_is_rejected() -> None:
@@ -292,3 +325,11 @@ def test_a_lateness_setting_that_cannot_become_a_policy_is_refused_at_load(
     # Refused when the settings load, not later when the consumer or the API builds the policy.
     with pytest.raises(ValidationError):
         make_settings(**overrides)
+
+
+def test_the_retry_policy_comes_from_the_settings() -> None:
+    policy = make_settings(
+        db_apply_attempts=5, consumer_max_poll_interval_ms=900_000
+    ).db_retry_policy()
+
+    assert policy == RetryPolicy(attempts=5, first_backoff_s=0.5, max_backoff_s=2.0)

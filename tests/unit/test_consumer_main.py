@@ -2,6 +2,7 @@
 
 import logging
 import os
+import signal
 import threading
 from datetime import timedelta
 from pathlib import Path
@@ -20,6 +21,7 @@ from event_pipeline.consumer.__main__ import (
     log_lost,
     log_revoked,
 )
+from event_pipeline.data.errors import RetryPolicy
 from event_pipeline.domain.lateness import LatenessPolicy
 
 
@@ -94,6 +96,59 @@ def test_arm_and_cancel_survive_a_signal_handler_arming_in_the_middle(
     watchdog.cancel()
 
 
+def installed_stop_handler(
+    monkeypatch: pytest.MonkeyPatch, stop: threading.Event, watchdog: CloseWatchdog
+) -> Any:
+    """The SIGTERM handler `_stop_on_signals` installs, without installing it in pytest."""
+    handlers: dict[int, Any] = {}
+    monkeypatch.setattr(
+        signal, "signal", lambda signum, handler: handlers.update({signum: handler})
+    )
+    consumer_main._stop_on_signals(stop, watchdog)
+    assert handlers[signal.SIGINT] is handlers[signal.SIGTERM]
+    return handlers[signal.SIGTERM]
+
+
+def test_a_signal_during_the_loops_stop_wait_neither_deadlocks_nor_is_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The loop pauses between retries with stop.wait() in the main thread, and Event.wait holds the
+    # Event's lock (a plain Lock) for a few bytecodes on entry and on wake-up. A handler that
+    # took that lock there would wait for its own thread forever: no stop, no watchdog.
+    stop = threading.Event()
+    armed: list[bool] = []
+    watchdog = CloseWatchdog(60.0)
+    monkeypatch.setattr(watchdog, "arm", lambda: armed.append(True))
+    handler = installed_stop_handler(monkeypatch, stop, watchdog)
+
+    def signal_while_holding_the_lock() -> None:
+        with stop._cond:  # type: ignore[attr-defined]  # what Event.wait holds
+            handler(signal.SIGTERM, None)
+
+    main_thread = threading.Thread(target=signal_while_holding_the_lock, daemon=True)
+    main_thread.start()
+    main_thread.join(2)
+
+    assert not main_thread.is_alive(), "the handler deadlocked on the stop flag's lock"
+    assert armed == [True]
+    # Set once the lock is free, so the loop still sees the request.
+    assert stop.wait(2)
+
+
+def test_a_second_signal_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    stop = threading.Event()
+    armed: list[bool] = []
+    watchdog = CloseWatchdog(60.0)
+    monkeypatch.setattr(watchdog, "arm", lambda: armed.append(True))
+    handler = installed_stop_handler(monkeypatch, stop, watchdog)
+
+    handler(signal.SIGTERM, None)
+    assert stop.wait(2)
+    handler(signal.SIGINT, None)
+
+    assert armed == [True]
+
+
 class _StubConsumer:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
@@ -107,6 +162,30 @@ class _StubConsumer:
 
 class _StubEngine:
     def dispose(self) -> None: ...
+
+
+def test_main_writes_dead_letters_through_the_service_on_its_engine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # no .env
+    engine = _StubEngine()
+    seen: dict[str, Any] = {}
+    stored: list[tuple[object, object]] = []
+    monkeypatch.setattr(consumer_main, "Consumer", _StubConsumer)
+    monkeypatch.setattr(consumer_main, "make_engine", lambda settings: engine)
+    monkeypatch.setattr(consumer_main, "_stop_on_signals", lambda stop, watchdog: None)
+    monkeypatch.setattr(consumer_main, "run", lambda *args, **kwargs: seen.update(kwargs))
+
+    def store(on: object, letter: object) -> bool:
+        stored.append((on, letter))
+        return True
+
+    monkeypatch.setattr(consumer_main, "store_dead_letter", store)
+
+    assert consumer_main.main() == 0
+    letter = object()
+    assert seen["dead_letter"](letter) is True
+    assert stored == [(engine, letter)]
 
 
 def test_main_runs_the_loop_with_the_configured_lateness_policy(
@@ -127,6 +206,22 @@ def test_main_runs_the_loop_with_the_configured_lateness_policy(
     assert seen["lateness"] == LatenessPolicy(
         allowed_lateness=timedelta(seconds=17), max_future_skew=timedelta(seconds=3)
     )
+
+
+def test_main_runs_the_loop_with_the_configured_retry_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Not the default (3): a hard-coded or default policy would not match.
+    monkeypatch.chdir(tmp_path)  # no .env
+    monkeypatch.setenv("DB_APPLY_ATTEMPTS", "2")
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(consumer_main, "Consumer", _StubConsumer)
+    monkeypatch.setattr(consumer_main, "make_engine", lambda settings: _StubEngine())
+    monkeypatch.setattr(consumer_main, "_stop_on_signals", lambda stop, watchdog: None)
+    monkeypatch.setattr(consumer_main, "run", lambda *args, **kwargs: seen.update(kwargs))
+
+    assert consumer_main.main() == 0
+    assert seen["retry"] == RetryPolicy(attempts=2, first_backoff_s=0.5, max_backoff_s=2.0)
 
 
 def test_main_subscribes_with_the_rebalance_callbacks_and_the_cooperative_strategy(
