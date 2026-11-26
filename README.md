@@ -27,9 +27,10 @@ Phases 1 (event contract), 2 (ingest), 3 (consumer and durable aggregate), 4 (la
 - `GET /stores/{store_id}/aggregates` reads the aggregates from PostgreSQL.
 
 Messages that are not counted, including events the database rejects, are kept in a `dead_letters`
-table, and a transient database error is retried a few times before the consumer stops (ADR 0006);
-replay and the failure tests come in later slices and phases; the
-[component table](docs/architecture.md#components) has the build order. This is a learning project,
+table, a transient database error is retried a few times before the consumer stops, and
+`make replay` publishes dead letters to the topic again (phase 6, ADR 0006). The failure tests in
+combination come in phase 7; the [component table](docs/architecture.md#components) has the build
+order. This is a learning project,
 not a production service.
 
 - [Architecture](docs/architecture.md): target design, data flow, crash points, build order
@@ -140,6 +141,44 @@ once, without the error's message; the failed event is redelivered on restart), 
 takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run that command, not
 `make`: `make` reports its own status when it receives a signal.
 
+### Replaying dead letters
+
+`make replay` (`uv run python -m event_pipeline.replay`) lists the dead letters read from
+`EVENTS_TOPIC` that it would publish again, and publishes nothing. Add `--execute` to publish them:
+each one's key, value and original `received_at` header go back to the topic, and the command waits
+for the broker to confirm each one (ADR 0006, decision 7). The consumer then handles every copy like
+any other message, so the replay changes no table itself.
+
+```sh
+make replay                                              # everything replayable, dry run
+make replay ARGS="--reason late_event"                   # one reason (repeatable)
+make replay ARGS="--event-id <uuid> --execute"           # one event, published
+make replay ARGS="--since 2026-11-25T10:00:00Z --until 2026-11-25T11:00:00Z"
+```
+
+`--since` and `--until` select by when a message was dead-lettered, as `[since, until)`, and need a
+UTC offset (`Z`). The output shows positions, reasons, event ids and counts, never a key or a value.
+Exit status: `0` when everything selected was published (or only listed); `1` when the broker did
+not confirm a message or the database could not be read; `2` for invalid arguments. Running the
+same replay again is safe: an event already counted is a duplicate the second time.
+
+A replayed message that still fails is dead-lettered again at its new offset, and the old row stays.
+Of the dead letters of one message (the same event id, key and value bytes, or for an
+`invalid_event` the same key and value) a replay therefore publishes only the newest, and reports
+how many older ones it left out; each run adds at most one dead letter per message that fails
+again. Copies of one event with different content are each published. To leave out what an
+earlier replay added, pass `--until` with the time that replay ran.
+
+What to do per reason (`detail` says more, without values):
+
+| `reason_code` | Cause | Replay |
+|---------------|-------|--------|
+| `late_event`, `future_event` | Received too long after, or before, `occurred_at` | Raise `ALLOWED_LATENESS_S` or `MAX_FUTURE_SKEW_S`, restart the consumer, then replay. Under the same limits it is dead-lettered again. |
+| `database_rejected` | PostgreSQL refused the values (SQLSTATE class `22`/`23` and constraint in `detail`), or a migration ahead of the code | Fix the cause (code or migration), then replay. |
+| `invalid_event` | The value broke the contract (violation codes in `detail`) | Fix the sender. A replay fails the same way unless the contract code changed. |
+| `invalid_received_at` | No valid `received_at` header: written by something other than the ingest API | Send it through `POST /events`. A replay sends the header as stored and fails again. |
+| `conflicting_duplicate` | An `event_id` reused for different content; the first copy is counted | Refused: replaying would only conflict again. Ask the sender. |
+
 ### Limitations
 
 - No authentication or rate limiting, and the broker and database connections are plaintext:
@@ -204,7 +243,17 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
   with `INCONSISTENT_GROUP_PROTOCOL`.
 - Stopping the consumer during an event slower than `CONSUMER_CLOSE_TIMEOUT_S` ends with status `2`
   and that event rolled back; it is redelivered on restart.
-- `processed_events` grows by one row per event and is never pruned yet.
+- `processed_events` grows by one row per event and `dead_letters` by one per message not counted;
+  neither is ever pruned (ADR 0006, decision 8). Deleting old dead letters is a manual `DELETE`.
+- A dead letter is not marked as replayed, so every replay with the same selection publishes it
+  again (harmless once counted: the consumer drops the duplicate). A replay loads every selected
+  dead letter into memory before publishing.
+- Dead letters are keyed by topic, partition and offset. Recreating the topic restarts its offsets,
+  so a new message at a position already in `dead_letters` would not be recorded; recreating the
+  topic is not supported.
+- Rebuilding every aggregate from the topic (emptying `order_aggregates` and `processed_events`,
+  then reading with a new consumer group) works only for the topic's retention, 7 days, and its
+  steps are destructive, so it is not scripted. A replay can only add to the aggregates.
 - An `event_id` reused for different content is only logged (`conflicting_duplicate`, with the
   `event_id`, partition and offset): the first applied copy stays counted and nobody tells the
   sender. "Different" compares the parsed event (`received_at` excluded, `occurred_at` as a UTC

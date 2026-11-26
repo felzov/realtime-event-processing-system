@@ -1,8 +1,8 @@
 # Architecture
 
-This is the **target** design. Ingest, the consumer, the aggregates, the query API and the
-late-event policy are built (phases 1–4); the [component table](#components) says which phase
-builds each part. Decisions are recorded in [ADRs](adr/README.md).
+This is the **target** design. Ingest, the consumer, the aggregates, the query API, the
+late-event policy, restart and rebalance handling, and the dead-letter path with replay are built
+(phases 1–6); the [component table](#components) says which phase builds each part. Decisions are recorded in [ADRs](adr/README.md).
 
 The broker is Apache Kafka 4.3.2 in KRaft mode, used through `confluent-kafka`; the consumer and
 the database access are synchronous ([ADR 0002](adr/0002-broker-and-client-stack.md)).
@@ -15,7 +15,8 @@ flowchart LR
     API -->|"produce, key = store_id, acks=all"| Topic[["Kafka topic<br/>orders.placed.v1"]]
     Topic -->|poll| Consumer[Consumer group<br/>manual offset commit]
     Consumer -->|"one transaction:<br/>dedup + aggregate upsert"| PG[(PostgreSQL)]
-    Consumer -.->|"invalid / late / poison<br/>(ADR 0006)"| DLQ[Dead-letter path]
+    Consumer -.->|"invalid / late / poison<br/>(ADR 0006)"| DLQ[("dead_letters<br/>(PostgreSQL)")]
+    DLQ -.->|"make replay --execute:<br/>key, value, original received_at"| Topic
     Reader[Client] -->|"GET aggregates"| Query[Query API]
     Query -->|read only| PG
 ```
@@ -26,6 +27,8 @@ flowchart LR
 - Events are partitioned by `store_id`, so one store's events are consumed in order. There is no
   order across stores ([ADR 0001](adr/0001-event-contract.md), decision 5).
 - The dead-letter path is a PostgreSQL table, `dead_letters`, keyed by topic position (ADR 0006).
+  A replay publishes dead letters back to the topic, never into the aggregate tables, so a replayed
+  message goes through deduplication, the lateness rule and per-store order like any other.
 
 ## Guarantees this design aims for
 
@@ -60,7 +63,9 @@ Each becomes a claim only when a test proves it. So far:
   events the database rejects (SQLSTATE class 22 or 23) are dead-lettered before their offset moves
   on, and the next message on the partition is processed; a transient database error is retried,
   then stops the consumer without committing (`tests/unit/test_consumer_loop.py`,
-  `tests/unit/test_db_errors.py`, `tests/integration/test_consumer.py`). Replay is not built yet.
+  `tests/unit/test_db_errors.py`, `tests/integration/test_consumer.py`). A replayed late event
+  counts once after the limit is raised, a second replay is a duplicate, and conflicting duplicates
+  are refused (`tests/unit/test_replay.py`, `tests/integration/test_replay.py`).
 
 ## Consume, apply, commit
 
@@ -136,6 +141,6 @@ business rules.
 | Query API (`GET /stores/{store_id}/aggregates`) | Read a store's aggregates in `[from, to)` from PostgreSQL only; parameters validated with the contract's rules and reason codes | 3 | Built |
 | Late-event policy (`domain/lateness.py`) | An event counts only if `received_at − occurred_at` ≤ `ALLOWED_LATENESS_S`; the consumer skips late, future and unstamped events (dead-lettered and logged, offset committed); ingest rejects events from the future (ADR 0005) | 4 | Built |
 | Restart and rebalance handling | Restart resumes at the committed offset (tested); `cooperative-sticky` assignment; an offset commit refused by a membership change is a WARNING, not a failure; assignments and revocations logged (ADR 0004, decisions 9-12) | 5 | Built |
-| Dead-letter path and replay | `dead_letters` table, written before the offset commit for invalid, late, future, unstamped, conflicting and database-rejected messages; transient database errors retried in place (`data/errors.py` classifies by SQLSTATE) (built); replay (not built yet) | 6 | Partly built |
+| Dead-letter path and replay (`make replay`) | `dead_letters` table, written before the offset commit for invalid, late, future, unstamped, conflicting and database-rejected messages; transient database errors retried in place (`data/errors.py` classifies by SQLSTATE); `services/replay.py` publishes the selected dead letters (newest per message: event id, key and value, `conflicting_duplicate` refused, dry run by default) to the topic and waits for every delivery report | 6 | Built |
 | Failure tests | Process kill, database down, broker down | 7 | Not built |
 | Guarantee and limitation docs, measurements | Written guarantees and a repeatable measurement script | 8 | Not built |

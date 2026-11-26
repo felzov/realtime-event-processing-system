@@ -92,13 +92,26 @@ SQLSTATE at all. The topic `orders.placed.v1` has `cleanup.policy=delete`, `rete
    indefinitely (this settles ADR 0004, decision 8). The topic keeps messages for 7 days.
 
 Decisions 2 and 3 are built in phase 6, slice 2; decisions 4 to 6 in slice 3; decision 7 in
-slice 4. Until then the consumer behaves as ADR 0004 and ADR 0005 describe.
+slice 4.
 
 **Update 2026-11-25 (phase 6, slice 3), decision 5:** an error without a SQLSTATE is transient only
 as an `OperationalError` or `InterfaceError` (no connection, a connection lost). psycopg also
 raises errors of its own without a SQLSTATE that mean our code passed something it cannot send
 (for example `ProgrammingError: cannot adapt type`); retrying those only reported a bug as an
 outage, so they now stop the consumer at once, as decision 6 does for any bug.
+
+**Update 2026-11-26 (phase 6, slice 4), decision 7:** of the selected dead letters with the same
+`event_id`, key and value bytes, a replay publishes only the newest (by `dead_lettered_at`,
+then position), and it reads only dead letters read from the configured events topic. A replayed
+message that fails again is dead-lettered at its new offset, with the same bytes, while the old
+row stays, so publishing every selected row would double an event's copies on each run with the
+same selection; with this rule each run adds at most one per copy. Copies of one `event_id` with
+different content are each published: keeping only the newest would leave the older one out for
+good, while the consumer, reading them in order, counts the first and reports the second as a
+conflicting duplicate. `invalid_event` rows have no `event_id` and are grouped by key and value
+alone: identical bytes fail or count identically, so publishing one copy loses nothing. The
+time range selects by `dead_lettered_at`, as `[since, until)`. Exit status: 0, 1 when a message
+was not confirmed or the database could not be read, 2 for invalid arguments.
 
 ## Consequences
 
@@ -107,7 +120,8 @@ outage, so they now stop the consumer at once, as decision 6 does for any bug.
 - **Replay keeps every guarantee of the normal path.** A replayed message is a new message on the
   topic: the consumer deduplicates it by `event_id`, applies the lateness rule, and orders it within
   its store's partition. Replaying twice is harmless: the second copy is a duplicate. A replayed
-  message that still fails becomes a new dead letter at its new offset.
+  message that still fails becomes a new dead letter at its new offset; dead letters are never
+  marked as replayed, so the same selection publishes them again on the next run.
 - **The original `received_at` means a replay re-evaluates, it does not backfill.** A late event
   replayed under the same `ALLOWED_LATENESS_S` is late again. Raising the limit and replaying counts
   it (ADR 0005, decision 7); a replay never removes anything already counted.
