@@ -1,5 +1,7 @@
 """The poll loop with a fake consumer: commit order, invalid messages, failures, stopping
-(phase 3 acceptance criteria 4 and 6), commits refused by a rebalance (phase 5 criterion 3)."""
+(phase 3 acceptance criteria 4 and 6), commits refused by a rebalance (phase 5 criterion 3),
+dead letters (phase 6 criteria 3 and 4), retries of transient database errors and events the
+database rejects (phase 6 criteria 5 and 6)."""
 
 import logging
 import threading
@@ -9,9 +11,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+import psycopg.errors
 import pytest
 from confluent_kafka import KafkaError, KafkaException
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 import event_pipeline
 from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, format_received_at
@@ -25,6 +29,7 @@ from event_pipeline.consumer.loop import (
     received_at_header,
     run,
 )
+from event_pipeline.data.errors import RetryPolicy
 from event_pipeline.domain.dead_letters import DeadLetter, DeadLetterReason
 from event_pipeline.domain.events import OrderPlacedEvent
 from event_pipeline.domain.lateness import LatenessPolicy
@@ -130,9 +135,32 @@ class FakeConsumer:
         return self.commit_result
 
 
+class RecordingStop(threading.Event):
+    """The stop flag, whose waits return at once and are recorded in `waits`.
+
+    `stop_on_wait` sets the flag when the loop starts waiting, as a signal arriving then would.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waits: list[float] = []
+        self.stop_on_wait = False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        assert timeout is not None
+        self.waits.append(timeout)
+        if self.stop_on_wait:
+            self.set()
+        return self.is_set()
+
+
+RETRY = RetryPolicy(attempts=3, first_backoff_s=0.5, max_backoff_s=2.0)
+
+
 class Harness:
     def __init__(self, *messages: FakeMessage | None) -> None:
-        self.stop = threading.Event()
+        self.stop = RecordingStop()
+        self.retry = RETRY
         self.calls: list[tuple[str, int | None]] = []
         self.consumer = FakeConsumer(list(messages), self.stop, self.calls)
         self.applied: list[OrderPlacedEvent] = []
@@ -160,6 +188,7 @@ class Harness:
             stop=self.stop,
             poll_timeout_s=POLL_TIMEOUT_S,
             lateness=LATENESS,
+            retry=self.retry,
         )
 
 
@@ -411,7 +440,8 @@ def test_a_dead_letter_already_recorded_is_noted_and_committed(
     assert harness.calls == [("dead_letter", 9), ("commit", 9)]
     assert (
         "dead letter at partition 4 offset 9 was already recorded at this position: a "
-        "redelivery, or an offset reused after the topic was recreated" in caplog.text
+        "redelivery, a retry after an unconfirmed commit, or an offset reused after the topic was "
+        "recreated" in caplog.text
     )
 
 
@@ -443,7 +473,8 @@ def test_a_failed_dead_letter_write_stops_the_loop_without_committing(
         harness.apply_result = lambda event: outcome
 
     def fail(letter: DeadLetter) -> bool:
-        raise RuntimeError("database unavailable")
+        # A bug, so no retry; a database outage is retried (see the transient tests below).
+        raise RuntimeError("bug in the dead-letter write")
 
     harness.dead_letter_result = fail
 
@@ -501,7 +532,9 @@ def test_a_database_error_writing_a_dead_letter_is_logged_without_the_message(
     with caplog.at_level(logging.WARNING):
         assert run_until_failure(harness) is error
 
+    # Class 23 from the dead letter's own insert is a bug (ADR 0006, decision 6): no retry.
     assert harness.calls == [("dead_letter", 9)]
+    assert harness.stop.waits == []
     assert "sqlstate=23514" in stopping_record(caplog).getMessage()
     assert PAYLOAD_MARKER not in caplog.text
 
@@ -544,14 +577,15 @@ def test_apply_error_stops_the_loop_without_committing(caplog: pytest.LogCapture
     with caplog.at_level(logging.ERROR):
         assert isinstance(run_until_failure(harness), RuntimeError)
 
-    # Stopped at the first message: no commit, the second message never read.
+    # Stopped at the first message: no retry, no commit, the second message never read.
     assert harness.calls == [("apply", None)]
+    assert harness.stop.waits == []
     message = stopping_record(caplog).getMessage()
     assert f"RuntimeError at partition 2 offset 5 event {EVENT_ID}" in message
     assert "offset commit not confirmed" in message
     # The deepest frame in our own code, relative to src/: the apply call in the loop.
     assert "(event_pipeline/consumer/loop.py:" in message
-    assert " in _process)" in message
+    assert " in apply_event)" in message
     assert PAYLOAD_MARKER not in caplog.text
 
 
@@ -562,30 +596,317 @@ class FakeDriverError(Exception):
         constraint_name = "ck_order_aggregates_currency_format"
 
 
-def test_database_error_is_logged_by_class_sqlstate_and_constraint_only(
+def test_an_event_the_database_rejects_is_dead_lettered_with_its_error_codes_only(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    harness = Harness(FakeMessage(event_bytes(), offset_=5))
+    # Until phase 6, slice 3 this stopped the loop. A CHECK violation is class 23: the event's
+    # values, so it is dead-lettered once, without a retry, and the next message is processed.
+    harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
     # As PostgreSQL reports a CHECK violation: the DETAIL repeats the row.
     error = IntegrityError(
         "INSERT ...", {"store_id": STORE_ID}, FakeDriverError(f"DETAIL: ({PAYLOAD_MARKER})")
     )
+    failures = [error]
 
-    def fail(event: OrderPlacedEvent) -> ApplyOutcome:
-        raise error
+    def fail_once(event: OrderPlacedEvent) -> ApplyOutcome:
+        if failures:
+            raise failures.pop()
+        return ApplyOutcome.APPLIED
 
-    harness.apply_result = fail
+    harness.apply_result = fail_once
 
-    with caplog.at_level(logging.ERROR):
-        assert run_until_failure(harness) is error
+    with caplog.at_level(logging.WARNING):
+        harness.run()
 
-    message = stopping_record(caplog).getMessage()
-    assert (
+    assert harness.calls == [
+        ("apply", None),
+        ("dead_letter", 5),
+        ("commit", 5),
+        ("apply", None),
+        ("commit", 6),
+    ]
+    assert harness.stop.waits == []
+    [letter] = harness.dead_letters
+    assert letter.reason is DeadLetterReason.DATABASE_REJECTED
+    assert str(letter.event_id) == EVENT_ID
+    described = (
         "IntegrityError FakeDriverError sqlstate=23514 "
-        "constraint=ck_order_aggregates_currency_format" in message
+        "constraint=ck_order_aggregates_currency_format"
+    )
+    assert letter.detail == described
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning.getMessage() == (
+        f"event {EVENT_ID} skipped at partition 2 offset 5: database_rejected, {described}"
     )
     assert PAYLOAD_MARKER not in caplog.text
     assert STORE_ID not in caplog.text
+
+
+# --- Transient and permanent database errors (ADR 0006, decisions 4 to 6) ------------------------
+
+
+def db_error(
+    wrapper: type[DataError | IntegrityError | OperationalError | ProgrammingError],
+    driver_error: Exception,
+) -> Exception:
+    """A database error as SQLAlchemy raises it, around psycopg's own class for the SQLSTATE.
+
+    The driver error's message carries the payload marker, as PostgreSQL's DETAIL would.
+    """
+    return wrapper("SQL ...", {"store_id": STORE_ID}, driver_error)
+
+
+# The classes the ADR 0006 spike saw for each case.
+REJECTING = [
+    db_error(DataError, psycopg.errors.NumericValueOutOfRange(PAYLOAD_MARKER)),
+    db_error(DataError, psycopg.errors.CharacterNotInRepertoire(PAYLOAD_MARKER)),
+    db_error(IntegrityError, psycopg.errors.CheckViolation(PAYLOAD_MARKER)),
+    db_error(IntegrityError, psycopg.errors.NotNullViolation(PAYLOAD_MARKER)),
+]
+REJECTING_IDS = ["22003", "22021", "23514", "23502"]
+TRANSIENT = [
+    db_error(OperationalError, psycopg.OperationalError(PAYLOAD_MARKER)),
+    db_error(OperationalError, psycopg.errors.QueryCanceled(PAYLOAD_MARKER)),
+    db_error(OperationalError, psycopg.errors.DeadlockDetected(PAYLOAD_MARKER)),
+    db_error(OperationalError, psycopg.errors.AdminShutdown(PAYLOAD_MARKER)),
+    db_error(ProgrammingError, psycopg.errors.UndefinedColumn(PAYLOAD_MARKER)),
+    db_error(ProgrammingError, psycopg.errors.UndefinedTable(PAYLOAD_MARKER)),
+    PoolTimeoutError("QueuePool limit reached"),
+]
+TRANSIENT_IDS = ["no_sqlstate", "57014", "40P01", "57P01", "42703", "42P01", "pool_timeout"]
+
+
+def failing(*errors: Exception, then: ApplyOutcome = ApplyOutcome.APPLIED) -> Any:
+    """An apply that raises `errors` in turn, then returns `then`."""
+    pending = list(errors)
+
+    def apply(event: OrderPlacedEvent) -> ApplyOutcome:
+        if pending:
+            raise pending.pop(0)
+        return then
+
+    return apply
+
+
+@pytest.mark.parametrize("error", REJECTING, ids=REJECTING_IDS)
+def test_a_rejected_event_is_dead_lettered_without_a_retry_and_does_not_block_the_next(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
+    harness.apply_result = failing(error)
+
+    with caplog.at_level(logging.WARNING):
+        harness.run()
+
+    assert harness.calls == [
+        ("apply", None),
+        ("dead_letter", 5),
+        ("commit", 5),
+        ("apply", None),
+        ("commit", 6),
+    ]
+    assert harness.stop.waits == []
+    [letter] = harness.dead_letters
+    assert letter.reason is DeadLetterReason.DATABASE_REJECTED
+    assert letter.detail is not None
+    assert f"sqlstate={error.orig.sqlstate}" in letter.detail  # type: ignore[attr-defined]
+    assert PAYLOAD_MARKER not in letter.detail
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+@pytest.mark.parametrize("error", TRANSIENT, ids=TRANSIENT_IDS)
+def test_a_transient_error_that_clears_within_the_attempts_applies_the_event_once(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5))
+    harness.apply_result = failing(error, error)
+
+    with caplog.at_level(logging.WARNING):
+        harness.run()
+
+    assert harness.calls == [("apply", None), ("apply", None), ("apply", None), ("commit", 5)]
+    assert harness.dead_letters == []
+    # 0.5 s, then 1 s, waited on the stop flag.
+    assert harness.stop.waits == [0.5, 1.0]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert warnings[0].startswith(
+        f"apply failed at partition 2 offset 5 event {EVENT_ID} (attempt 1 of 3): "
+    )
+    assert warnings[0].endswith("; retrying in 0.5 s")
+    assert warnings[1].endswith("; retrying in 1.0 s")
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert PAYLOAD_MARKER not in caplog.text
+    assert STORE_ID not in caplog.text
+
+
+@pytest.mark.parametrize("error", TRANSIENT, ids=TRANSIENT_IDS)
+def test_a_transient_error_on_every_attempt_stops_the_loop_without_a_dead_letter(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Class 42 (a migration not run) included: it stops the consumer, it does not dead-letter
+    # every event.
+    harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
+    harness.apply_result = failing(error, error, error)
+
+    with caplog.at_level(logging.WARNING):
+        assert run_until_failure(harness) is error
+
+    assert harness.calls == [("apply", None), ("apply", None), ("apply", None)]
+    assert harness.dead_letters == []
+    assert harness.stop.waits == [0.5, 1.0]
+    message = stopping_record(caplog).getMessage()
+    assert message.startswith(f"consumer stopping: {describe_error(error)} at partition 2 offset 5")
+    assert message.endswith("offset commit not confirmed; apply failed 3 of 3 attempts")
+    assert PAYLOAD_MARKER not in caplog.text
+    assert STORE_ID not in caplog.text
+
+
+def test_a_stop_requested_while_waiting_to_retry_ends_the_wait_and_stops_as_a_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5), FakeMessage(event_bytes(), offset_=6))
+    error = TRANSIENT[1]
+    harness.apply_result = failing(error)
+    harness.stop.stop_on_wait = True
+
+    with caplog.at_level(logging.WARNING):
+        assert run_until_failure(harness) is error
+
+    # No second attempt, no commit: the event is redelivered after a restart.
+    assert harness.calls == [("apply", None)]
+    assert harness.stop.waits == [0.5]
+    assert (
+        stopping_record(caplog)
+        .getMessage()
+        .endswith("; apply failed 1 of 3 attempts, and a stop was requested before the next")
+    )
+
+
+def test_a_rejection_after_a_transient_error_is_dead_lettered() -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5))
+    harness.apply_result = failing(TRANSIENT[0], REJECTING[0])
+
+    harness.run()
+
+    assert harness.calls == [("apply", None), ("apply", None), ("dead_letter", 5), ("commit", 5)]
+    assert harness.stop.waits == [0.5]
+    assert [letter.reason for letter in harness.dead_letters] == [
+        DeadLetterReason.DATABASE_REJECTED
+    ]
+
+
+def test_a_single_attempt_means_no_retry() -> None:
+    harness = Harness(FakeMessage(event_bytes(), offset_=5))
+    harness.retry = RetryPolicy(attempts=1, first_backoff_s=0.5, max_backoff_s=2.0)
+    harness.apply_result = failing(TRANSIENT[0])
+
+    run_until_failure(harness)
+
+    assert harness.calls == [("apply", None)]
+    assert harness.stop.waits == []
+
+
+def test_a_bug_after_a_transient_error_stops_at_once(caplog: pytest.LogCaptureFixture) -> None:
+    # Every attempt's error is classified again: a bug on the second stops without a third.
+    harness = Harness(FakeMessage(event_bytes(), offset_=5))
+    bug = RuntimeError(PAYLOAD_MARKER)
+    harness.apply_result = failing(TRANSIENT[0], bug)
+
+    with caplog.at_level(logging.ERROR):
+        assert run_until_failure(harness) is bug
+
+    assert harness.calls == [("apply", None), ("apply", None)]
+    assert harness.stop.waits == [0.5]
+    message = stopping_record(caplog).getMessage()
+    assert message.startswith("consumer stopping: RuntimeError at partition 2 offset 5")
+    assert "attempts" not in message
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+def test_a_retry_after_an_unconfirmed_commit_finds_a_duplicate_and_moves_on() -> None:
+    # The first attempt's COMMIT reached PostgreSQL but its answer was lost (a transient error):
+    # the retry finds the event_id with the same fingerprint, so it is not counted twice and not
+    # dead-lettered.
+    harness = Harness(FakeMessage(event_bytes(), offset_=5))
+    harness.apply_result = failing(TRANSIENT[0], then=ApplyOutcome.DUPLICATE)
+
+    harness.run()
+
+    assert harness.calls == [("apply", None), ("apply", None), ("commit", 5)]
+    assert harness.dead_letters == []
+
+
+def test_a_failed_dead_letter_write_after_a_rejection_stops_with_both_reasons(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The only path where two database errors meet in one message: the apply's rejection is
+    # handled, the dead letter's own error stops the loop and is the one reported.
+    harness = Harness(FakeMessage(event_bytes(), offset_=9))
+    harness.apply_result = failing(REJECTING[0])
+    write_error = REJECTING[2]  # class 23 from the dead letter's insert: a bug, no retry
+
+    def fail(letter: DeadLetter) -> bool:
+        raise write_error
+
+    harness.dead_letter_result = fail
+
+    with caplog.at_level(logging.WARNING):
+        assert run_until_failure(harness) is write_error
+
+    assert harness.calls == [("apply", None), ("dead_letter", 9)]
+    assert harness.stop.waits == []
+    message = stopping_record(caplog).getMessage()
+    assert message.startswith(
+        "consumer stopping: IntegrityError CheckViolation sqlstate=23514 at partition 2 offset 9"
+    )
+    assert message.endswith(
+        "; it was being dead-lettered as database_rejected "
+        "(DataError NumericValueOutOfRange sqlstate=22003)"
+    )
+    assert PAYLOAD_MARKER not in caplog.text
+    assert STORE_ID not in caplog.text
+
+
+def test_a_transient_error_writing_a_dead_letter_is_retried() -> None:
+    harness = Harness(FakeMessage(b"{not json", offset_=9))
+    pending = [TRANSIENT[0]]
+
+    def fail_once(letter: DeadLetter) -> bool:
+        if pending:
+            raise pending.pop()
+        return True
+
+    harness.dead_letter_result = fail_once
+
+    harness.run()
+
+    assert harness.calls == [("dead_letter", 9), ("dead_letter", 9), ("commit", 9)]
+    assert harness.stop.waits == [0.5]
+
+
+def test_a_transient_error_writing_a_dead_letter_on_every_attempt_stops_the_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    harness = Harness(FakeMessage(b"{not json", offset_=9))
+
+    def fail(letter: DeadLetter) -> bool:
+        raise TRANSIENT[1]
+
+    harness.dead_letter_result = fail
+
+    with caplog.at_level(logging.ERROR):
+        run_until_failure(harness)
+
+    assert harness.calls == [("dead_letter", 9)] * 3
+    assert (
+        stopping_record(caplog)
+        .getMessage()
+        .endswith(
+            "; dead letter failed 3 of 3 attempts; it was being dead-lettered as "
+            "invalid_event (invalid_json)"
+        )
+    )
 
 
 def test_offset_commit_that_raises_stops_the_loop(caplog: pytest.LogCaptureFixture) -> None:

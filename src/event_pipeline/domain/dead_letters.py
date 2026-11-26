@@ -34,8 +34,9 @@ class DeadLetterReason(StrEnum):
 class DeadLetter:
     """One message that was not counted, as it was read, and why.
 
-    `detail` is text this project writes (violation codes, a delay, a database error's class and
-    SQLSTATE), never a value from the message. `event_id` is set when the value parsed as an event.
+    `detail` is text this project writes (violation codes, a delay, a database error's classes,
+    SQLSTATE and constraint name), never a value from the message. `event_id` is set when the
+    value parsed as an event.
     """
 
     topic: str

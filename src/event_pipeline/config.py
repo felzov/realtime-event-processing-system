@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
+from event_pipeline.data.errors import RetryPolicy
 from event_pipeline.domain.lateness import LatenessPolicy
 
 # librdkafka checks message timeouts about once a second, so `_MSG_TIMED_OUT` can arrive up to about
@@ -35,10 +36,18 @@ DEFAULT_LATENESS = LatenessPolicy(
     max_future_skew=timedelta(seconds=DEFAULT_MAX_FUTURE_SKEW_S),
 )
 
-# Statements one event can run: the pool's pre-ping, the processed_events insert, then either the
-# aggregate upsert (new event) or the select of the stored fingerprint (duplicate), and COMMIT
-# (services/aggregation.py).
-DB_STATEMENTS_PER_EVENT = 4
+# Statements one transaction of the consumer can run, the longer of its two kinds: an apply runs
+# the pool's pre-ping, the processed_events insert, then either the aggregate upsert (new event) or
+# the select of the stored fingerprint (duplicate), and COMMIT (services/aggregation.py); a dead
+# letter runs the pre-ping, its insert and COMMIT (services/dead_letters.py).
+DB_STATEMENTS_PER_TRANSACTION = 4
+# Transactions one message can need: its apply, then its dead letter (a conflicting duplicate, or
+# an event the database rejects on its last attempt). Each can take every attempt (ADR 0006).
+DB_TRANSACTIONS_PER_MESSAGE = 2
+# The pauses between attempts of a transient database error (ADR 0006, decision 5): 0.5 s, 1 s,
+# then 2 s each.
+DB_RETRY_FIRST_BACKOFF_S = 0.5
+DB_RETRY_MAX_BACKOFF_S = 2.0
 # How many times that worst case must fit into max.poll.interval.ms, so it stays well under it.
 POLL_INTERVAL_MARGIN = 2
 # librdkafka's default session.timeout.ms, which max.poll.interval.ms may not be below.
@@ -104,6 +113,9 @@ class Settings(BaseSettings):
     db_statement_timeout_ms: int = Field(default=5_000, gt=0)
     # How long a caller waits for a free connection from the engine's pool before an error.
     db_pool_timeout_s: float = Field(default=5.0, gt=0)
+    # How many times the consumer runs one transaction (an apply or a dead letter) when it fails
+    # with a transient database error, before it stops (ADR 0006, decision 5). 1 means no retry.
+    db_apply_attempts: int = Field(default=3, ge=1)
 
     # The consumer group of `make consumer`. Every consumer with this id shares the topic's
     # partitions and the committed offsets; a new id re-reads the topic from the start (ADR 0004,
@@ -115,11 +127,21 @@ class Settings(BaseSettings):
     # messages arrive.
     consumer_poll_timeout_s: float = Field(default=1.0, gt=0)
     # librdkafka's max.poll.interval.ms: a consumer that does not poll again within it is removed
-    # from the group, and its partitions move to another consumer.
-    consumer_max_poll_interval_ms: int = Field(default=300_000, gt=0)
+    # from the group, and its partitions move to another consumer. 600 s rather than librdkafka's
+    # 300 s: with the database defaults and retries, one message can take 183 s (see the
+    # validator), and the validator wants twice that.
+    consumer_max_poll_interval_ms: int = Field(default=600_000, gt=0)
     # From a stop request to the process exiting: finishing the current event, leaving the group.
     # Past it the process exits anyway, with an error status (consumer/__main__.py).
     consumer_close_timeout_s: float = Field(default=10.0, gt=0)
+
+    def db_retry_policy(self) -> RetryPolicy:
+        """How the consumer retries a transient database error (ADR 0006, decision 5)."""
+        return RetryPolicy(
+            attempts=self.db_apply_attempts,
+            first_backoff_s=DB_RETRY_FIRST_BACKOFF_S,
+            max_backoff_s=DB_RETRY_MAX_BACKOFF_S,
+        )
 
     def lateness_policy(self) -> LatenessPolicy:
         """The late-event policy for the consumer and the ingest API (ADR 0005)."""
@@ -146,16 +168,24 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
-    def _one_event_fits_well_within_the_poll_interval(self) -> Self:
-        # The consumer polls again only after the event's transaction and offset commit. Their
-        # database part is bounded by the timeouts: waiting for a pooled connection, opening one,
-        # and up to DB_STATEMENTS_PER_EVENT statements. If that bound came near max.poll.interval,
-        # a slow but successful apply would get the consumer removed from its group mid-event.
-        # The offset commit after it is not in the bound: its time is set by librdkafka's own
-        # request and coordinator timeouts, not by a setting here; the margin is meant to absorb it.
-        apply_bound_ms = (
+    def _one_message_fits_well_within_the_poll_interval(self) -> Self:
+        # The consumer polls again only after the message's transactions and offset commit. One
+        # transaction's database time is bounded by the timeouts: waiting for a pooled connection,
+        # opening one, and up to DB_STATEMENTS_PER_TRANSACTION statements. A transient error runs
+        # it again, up to db_apply_attempts times with pauses between (ADR 0006, decision 5), and a
+        # message can need two transactions, each with every attempt: 183 s with the defaults. If
+        # that bound came near max.poll.interval, a slow but successful message would get the
+        # consumer removed from its group mid-message. The offset commit after it is not in the
+        # bound: its time is set by librdkafka's own request and coordinator timeouts, not by a
+        # setting here; the margin is meant to absorb it.
+        transaction_bound_ms = (
             self.db_pool_timeout_s + self.db_connect_timeout_s
-        ) * 1000 + DB_STATEMENTS_PER_EVENT * self.db_statement_timeout_ms
+        ) * 1000 + DB_STATEMENTS_PER_TRANSACTION * self.db_statement_timeout_ms
+        retried_bound_ms = (
+            self.db_apply_attempts * transaction_bound_ms
+            + self.db_retry_policy().total_backoff_s() * 1000
+        )
+        message_bound_ms = DB_TRANSACTIONS_PER_MESSAGE * retried_bound_ms
         if self.consumer_max_poll_interval_ms < LIBRDKAFKA_SESSION_TIMEOUT_MS:
             # librdkafka refuses to create a consumer otherwise (session.timeout.ms is left at its
             # default).
@@ -163,11 +193,13 @@ class Settings(BaseSettings):
                 f"consumer_max_poll_interval_ms must be at least {LIBRDKAFKA_SESSION_TIMEOUT_MS} "
                 "(librdkafka's session.timeout.ms)"
             )
-        if self.consumer_max_poll_interval_ms < POLL_INTERVAL_MARGIN * apply_bound_ms:
+        if self.consumer_max_poll_interval_ms < POLL_INTERVAL_MARGIN * message_bound_ms:
             raise ValueError(
                 f"consumer_max_poll_interval_ms must be at least {POLL_INTERVAL_MARGIN} times the "
-                "worst-case database time of one event (pool + connect timeouts + "
-                f"{DB_STATEMENTS_PER_EVENT} x db_statement_timeout_ms)"
+                f"worst-case database time of one message: {DB_TRANSACTIONS_PER_MESSAGE} x "
+                "(db_apply_attempts x (pool + connect timeouts + "
+                f"{DB_STATEMENTS_PER_TRANSACTION} x db_statement_timeout_ms) + the pauses between "
+                "attempts)"
             )
         return self
 

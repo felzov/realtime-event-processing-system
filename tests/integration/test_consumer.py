@@ -1,4 +1,5 @@
-"""The consumer against real Kafka and PostgreSQL (phase 3 criteria 5 and 6, phase 5 criterion 2).
+"""The consumer against real Kafka and PostgreSQL (phase 3 criteria 5 and 6, phase 5 criterion 2,
+phase 6 criteria 3 to 6).
 
 Each test has its own topic, consumer group and store ids, so tests never share offsets or rows.
 """
@@ -21,7 +22,7 @@ from confluent_kafka import Consumer, KafkaError, KafkaException, Message, Produ
 from confluent_kafka.admin import AdminClient
 from pydantic import SecretStr
 from sqlalchemy import Connection, Engine, event, func, select, text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from event_pipeline.broker.config import consumer_config, producer_config
 from event_pipeline.broker.publisher import RECEIVED_AT_HEADER, EventPublisher, format_received_at
@@ -29,6 +30,8 @@ from event_pipeline.broker.topics import TopicSpec, ensure_topic
 from event_pipeline.config import Settings
 from event_pipeline.consumer.__main__ import subscribe
 from event_pipeline.consumer.loop import CommittedPartition, Headers, run
+from event_pipeline.data.engine import make_engine
+from event_pipeline.data.errors import RetryPolicy, sqlstate_of
 from event_pipeline.data.tables import dead_letters, order_aggregates, processed_events
 from event_pipeline.domain.dead_letters import DeadLetter
 from event_pipeline.domain.events import OrderPlacedEvent
@@ -247,6 +250,7 @@ class RunningConsumer:
         engine: Engine,
         wrap: Callable[[Consumer], Any] = lambda consumer: consumer,
         stop_flag: threading.Event | None = None,
+        retry: RetryPolicy | None = None,
     ) -> None:
         self.consumer = Consumer(consumer_config(settings))
         # With the process's rebalance callbacks (consumer/__main__.py), so they are exercised too.
@@ -272,6 +276,7 @@ class RunningConsumer:
                     stop=self.stop_flag,
                     poll_timeout_s=settings.consumer_poll_timeout_s,
                     lateness=settings.lateness_policy(),
+                    retry=retry or settings.db_retry_policy(),
                 )
             except BaseException as exc:  # read by the test after join
                 self.error = exc
@@ -802,17 +807,13 @@ def test_a_new_group_rereads_the_topic_and_changes_no_aggregate(
     assert committed_offsets(settings) == log_end
 
 
-# --- A database failure stops the consumer -------------------------------------------------------
+# --- Database errors: rejected events and transient failures (ADR 0006, decisions 4 to 6) -----
 
 
-def test_database_failure_stops_the_consumer_without_committing(
-    settings: Settings,
-    migrated_engine: Engine,
-    running: list[RunningConsumer],
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def store_at_the_bigint_limit(engine: Engine) -> str:
+    """A store whose WINDOW row in EUR already holds the largest `bigint` revenue."""
     store_id = f"store-{uuid.uuid4().hex[:8]}"
-    with migrated_engine.begin() as connection:
+    with engine.begin() as connection:
         connection.execute(
             order_aggregates.insert().values(
                 store_id=store_id,
@@ -822,19 +823,187 @@ def test_database_failure_stops_the_consumer_without_committing(
                 revenue_minor=2**63 - 1,
             )
         )
-    produce(settings, encode(event_body(store_id, amount_minor=1)), key=store_id.encode())
+    return store_id
 
-    with caplog.at_level(logging.ERROR, logger="event_pipeline.consumer.loop"):
+
+def test_an_event_the_database_rejects_is_dead_lettered_and_the_next_is_applied(
+    settings: Settings,
+    migrated_engine: Engine,
+    running: list[RunningConsumer],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Until phase 6, slice 3 this overflow stopped the consumer on every restart: its partition
+    # was blocked. Now it is a dead letter, and the next event on the same partition counts.
+    store_id = store_at_the_bigint_limit(migrated_engine)
+    overflowing = event_body(store_id, amount_minor=1)
+    next_minute = event_body(store_id, amount_minor=7, occurred_at="2026-11-22T12:31:15Z")
+    produce(settings, encode(overflowing), encode(next_minute), key=store_id.encode())
+    log_end = end_offsets(settings)
+
+    with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
         consumer = RunningConsumer(settings, migrated_engine)
         running.append(consumer)
-        consumer.thread.join(TIMEOUT_S)
-        consumer.stop()
+        wait_for(
+            lambda: committed_offsets(settings) == log_end, "both offsets", watching=[consumer]
+        )
+
+    assert consumer.outcomes == [ApplyOutcome.APPLIED]
+    [(_, reason, detail, event_id)] = dead_lettered(migrated_engine, settings.events_topic)
+    assert reason == "database_rejected"
+    assert event_id == overflowing["event_id"]
+    # numeric_value_out_of_range; classes and SQLSTATE only.
+    assert detail == "DataError NumericValueOutOfRange sqlstate=22003"
+    # The rejected apply was rolled back: the full row is unchanged, the event not recorded.
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 2**63 - 1), ("EUR", 1, 7)]
+    assert recorded(migrated_engine, overflowing) == 0
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "database_rejected" in caplog.records[0].getMessage()
+    assert store_id not in caplog.text
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+def impatient_engine(db_settings_for: Callable[..., Settings]) -> Engine:
+    """The application's engine with a 300 ms statement timeout, so a held lock times out fast."""
+    return make_engine(db_settings_for(db_statement_timeout_ms=300))
+
+
+def retry_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "retrying in" in r.getMessage()
+    ]
+
+
+def test_a_lock_that_clears_within_the_attempts_applies_the_event_once(
+    settings: Settings,
+    migrated_engine: Engine,
+    db_settings_for: Callable[..., Settings],
+    running: list[RunningConsumer],
+    row_lock: Callable[[str], tuple[Connection, int]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A real transient error: the upsert waits on a row another transaction holds until the
+    # statement timeout cancels it (57014). The lock goes away before the attempts run out.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    blocker, _ = row_lock(store_id)
+    produce(settings, encode(event_body(store_id, amount_minor=4)), key=store_id.encode())
+    engine = impatient_engine(db_settings_for)
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+            consumer = RunningConsumer(settings, engine)
+            running.append(consumer)
+            wait_for(lambda: retry_warnings(caplog) != [], "a retry", watching=[consumer])
+            blocker.rollback()
+            wait_for(
+                lambda: committed_offsets(settings) == end_offsets(settings),
+                "the offset",
+                watching=[consumer],
+            )
+    finally:
+        engine.dispose()
+
+    assert consumer.outcomes == [ApplyOutcome.APPLIED]
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 4)]
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+    warnings = retry_warnings(caplog)
+    assert 1 <= len(warnings) <= 2
+    assert "(attempt 1 of 3): OperationalError QueryCanceled sqlstate=57014" in warnings[0]
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+def test_a_lock_held_past_every_attempt_stops_the_consumer_without_committing(
+    settings: Settings,
+    migrated_engine: Engine,
+    db_settings_for: Callable[..., Settings],
+    running: list[RunningConsumer],
+    row_lock: Callable[[str], tuple[Connection, int]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    row_lock(store_id)
+    produce(settings, encode(event_body(store_id, amount_minor=4)), key=store_id.encode())
+    engine = impatient_engine(db_settings_for)
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+            consumer = RunningConsumer(settings, engine)
+            running.append(consumer)
+            consumer.thread.join(TIMEOUT_S)
+    finally:
+        engine.dispose()
 
     assert consumer.error is not None
-    assert isinstance(consumer.error.__cause__, DBAPIError)
+    cause = consumer.error.__cause__
+    assert isinstance(cause, OperationalError)
+    assert sqlstate_of(cause) == "57014"
+    # Not dead-lettered, not committed: a restart once the database is healthy applies it.
     assert committed_offsets(settings) == {}
-    [record] = [r for r in caplog.records if r.name == "event_pipeline.consumer.loop"]
-    assert "sqlstate=22003" in record.getMessage()  # numeric_value_out_of_range
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+    assert len(retry_warnings(caplog)) == 2
+    [stopping] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert stopping.getMessage().endswith("; apply failed 3 of 3 attempts")
+    assert store_id not in caplog.text
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+def without_the_fingerprint_column(engine: Engine) -> None:
+    """Make the engine's processed_events insert name a column the table does not have, so
+    PostgreSQL itself answers 42703, as for code deployed before its migration ran. The schema
+    is not touched: other tests share it."""
+
+    def rename(
+        conn: Connection,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> tuple[str, Any]:
+        if statement.startswith("INSERT INTO processed_events"):
+            # Only the first occurrence, the column list: the bind parameter keeps its name.
+            statement = statement.replace("body_sha256", "body_sha256_not_migrated", 1)
+        return statement, parameters
+
+    event.listen(engine, "before_cursor_execute", rename, retval=True)
+
+
+def test_a_missing_column_stops_the_consumer_instead_of_dead_lettering(
+    settings: Settings,
+    db_settings_for: Callable[..., Settings],
+    migrated_engine: Engine,
+    running: list[RunningConsumer],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Class 42 is transient on purpose (ADR 0006, decision 5): a schema behind the code must stop
+    # the consumer, not move every event into dead_letters.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    produce(settings, encode(event_body(store_id, amount_minor=4)), key=store_id.encode())
+    engine = make_engine(db_settings_for())
+    without_the_fingerprint_column(engine)
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+            consumer = RunningConsumer(
+                settings,
+                engine,
+                retry=RetryPolicy(attempts=2, first_backoff_s=0.1, max_backoff_s=0.1),
+            )
+            running.append(consumer)
+            consumer.thread.join(TIMEOUT_S)
+    finally:
+        engine.dispose()
+
+    assert consumer.error is not None
+    cause = consumer.error.__cause__
+    assert isinstance(cause, ProgrammingError)
+    assert sqlstate_of(cause) == "42703"  # undefined_column
+    assert len(retry_warnings(caplog)) == 1
+    [stopping] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert "ProgrammingError UndefinedColumn sqlstate=42703" in stopping.getMessage()
+    assert stopping.getMessage().endswith("; apply failed 2 of 2 attempts")
+    assert committed_offsets(settings) == {}
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+    assert counts(migrated_engine, store_id) == []
     assert store_id not in caplog.text
     assert PAYLOAD_MARKER not in caplog.text
 
@@ -1022,6 +1191,8 @@ def test_shutdown_past_the_close_timeout_ends_the_process_with_status_2(
         tmp_path,
         CONSUMER_CLOSE_TIMEOUT_S="1.5",
         DB_STATEMENT_TIMEOUT_MS="30000",
+        # One attempt, so the 30 s timeout stays within the default max.poll.interval's bound.
+        DB_APPLY_ATTEMPTS="1",
     )
     processes.append(consumer)
     consumer.wait_for(lambda: blocked_by(migrated_engine, blocker_pid), "the upsert to wait")
@@ -1043,20 +1214,16 @@ def test_failure_ends_the_process_with_status_1_and_one_line_without_the_payload
     test_database_url: SecretStr,
     tmp_path: Path,
     processes: list[ConsumerProcess],
+    row_lock: Callable[[str], tuple[Connection, int]],
 ) -> None:
+    # Until phase 6, slice 3 a bigint overflow stopped the process; it is a dead letter now. A
+    # lock held past every attempt is a failure that still stops it.
     store_id = f"store-{uuid.uuid4().hex[:8]}"
-    with migrated_engine.begin() as connection:
-        connection.execute(
-            order_aggregates.insert().values(
-                store_id=store_id,
-                window_start=WINDOW,
-                currency="EUR",
-                order_count=1,
-                revenue_minor=2**63 - 1,
-            )
-        )
+    row_lock(store_id)
     produce(settings, encode(event_body(store_id, amount_minor=1)), key=store_id.encode())
-    consumer = ConsumerProcess(settings, test_database_url, tmp_path)
+    consumer = ConsumerProcess(
+        settings, test_database_url, tmp_path, DB_STATEMENT_TIMEOUT_MS="300", DB_APPLY_ATTEMPTS="2"
+    )
     processes.append(consumer)
 
     status = consumer.finish()
@@ -1064,13 +1231,85 @@ def test_failure_ends_the_process_with_status_1_and_one_line_without_the_payload
     assert status == 1, consumer.output
     errors = [line for line in consumer.output.splitlines() if " ERROR " in line]
     assert len(errors) == 1, consumer.output
-    assert "sqlstate=22003" in errors[0]
+    assert "sqlstate=57014" in errors[0]  # query_canceled: the statement timeout
     # Which statement failed: the upsert, not the processed_events insert.
     assert "event_pipeline/data/aggregates.py:" in errors[0]
     assert " in add_order_to_aggregate)" in errors[0]
+    assert errors[0].endswith("; apply failed 2 of 2 attempts")
+    retries = [line for line in consumer.output.splitlines() if "retrying in 0.5 s" in line]
+    assert len(retries) == 1, consumer.output
     # No traceback, no DETAIL, no statement parameters: nothing of the event but its id.
     assert "Traceback" not in consumer.output
     assert store_id not in consumer.output
     assert PAYLOAD_MARKER not in consumer.output
     assert committed_offsets(settings) == {}
     assert group_members(settings) == 0
+
+
+def test_sigterm_during_a_retry_pause_stops_at_once_with_status_1(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    tmp_path: Path,
+    processes: list[ConsumerProcess],
+    row_lock: Callable[[str], tuple[Connection, int]],
+) -> None:
+    # Five attempts: 0.5 + 1 + 2 + 2 s of pauses still ahead after the first failure, so a
+    # prompt exit shows the stop request cut the pause short instead of waiting the attempts out.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    row_lock(store_id)
+    produce(settings, encode(event_body(store_id, amount_minor=1)), key=store_id.encode())
+    consumer = ConsumerProcess(
+        settings, test_database_url, tmp_path, DB_STATEMENT_TIMEOUT_MS="300", DB_APPLY_ATTEMPTS="5"
+    )
+    processes.append(consumer)
+    # A reader thread collects the output, so waiting for a line never blocks on a silent
+    # process and the deadline below always applies.
+    lines: list[str] = []
+
+    def read_output() -> None:
+        assert consumer.process.stdout is not None
+        lines.extend(consumer.process.stdout)
+
+    reader = threading.Thread(target=read_output, name="consumer-output", daemon=True)
+    reader.start()
+
+    def output() -> str:
+        return "".join(lines)
+
+    deadline = time.monotonic() + TIMEOUT_S
+    while not any("retrying in 0.5 s" in line for line in lines):
+        if not consumer.alive() or time.monotonic() > deadline:
+            consumer.process.kill()
+            reader.join(timeout=5)
+            exited = consumer.process.poll()
+            pytest.fail(f"waiting for the first retry; process status {exited}:\n{output()}")
+        time.sleep(0.05)
+    signalled_at = time.monotonic()
+    consumer.process.send_signal(signal.SIGTERM)
+    try:
+        status = consumer.process.wait(timeout=CLOSE_TIMEOUT_S + 5)
+    except subprocess.TimeoutExpired:
+        consumer.process.kill()
+        reader.join(timeout=5)
+        pytest.fail(f"the consumer process did not exit:\n{output()}")
+    elapsed_s = time.monotonic() - signalled_at
+    reader.join(timeout=5)
+    consumer.output = output()
+
+    assert status == 1, consumer.output
+    # Well under the 4.5 s of pauses left (plus 300 ms per attempt); leaving the group included.
+    assert elapsed_s < 3.0, consumer.output
+    errors = [line for line in consumer.output.splitlines() if " ERROR " in line]
+    assert len(errors) == 1, consumer.output
+    assert "sqlstate=57014" in errors[0]
+    # The signal usually lands in the first pause ("failed 1 of 5"); on a slow machine it can
+    # land during attempt 2, which is then the one cut short. Either way the pause is not waited.
+    assert "; apply failed " in errors[0]
+    assert errors[0].endswith(" of 5 attempts, and a stop was requested before the next"), (
+        consumer.output
+    )
+    assert committed_offsets(settings) == {}
+    assert group_members(settings) == 0
+    assert store_id not in consumer.output
+    assert PAYLOAD_MARKER not in consumer.output
