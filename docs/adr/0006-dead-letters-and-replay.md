@@ -94,6 +94,12 @@ SQLSTATE at all. The topic `orders.placed.v1` has `cleanup.policy=delete`, `rete
 Decisions 2 and 3 are built in phase 6, slice 2; decisions 4 to 6 in slice 3; decision 7 in
 slice 4. Until then the consumer behaves as ADR 0004 and ADR 0005 describe.
 
+**Update 2026-11-25 (phase 6, slice 3), decision 5:** an error without a SQLSTATE is transient only
+as an `OperationalError` or `InterfaceError` (no connection, a connection lost). psycopg also
+raises errors of its own without a SQLSTATE that mean our code passed something it cannot send
+(for example `ProgrammingError: cannot adapt type`); retrying those only reported a bug as an
+outage, so they now stop the consumer at once, as decision 6 does for any bug.
+
 ## Consequences
 
 - **A poison event no longer blocks its partition.** It costs one dead-letter row, and the next
@@ -124,7 +130,18 @@ slice 4. Until then the consumer behaves as ADR 0004 and ADR 0005 describe.
 - **Rebuilding all aggregates from the topic is possible only within its 7-day retention**, and it
   is a documented manual procedure with destructive steps, not a script.
 - **Retrying in place lengthens the worst case per event**, so the minimum
-  `CONSUMER_MAX_POLL_INTERVAL_MS` grows with `DB_APPLY_ATTEMPTS`.
+  `CONSUMER_MAX_POLL_INTERVAL_MS` grows with `DB_APPLY_ATTEMPTS`. A message can need two
+  transactions (its apply, then its dead letter), each with every attempt: 183 s with the default
+  timeouts and 3 attempts. The validator wants twice that, so the default rose from 300 s to 600 s
+  (slice 3), and a consumer stuck outside the database leaves its group only after 10 minutes.
+  While it retries the consumer does not poll, so a rebalance waits for it, up to that long.
+- **A migration ahead of the code turns every event into a dead letter.** A constraint the running
+  code violates (a `NOT NULL` column without a default, a stricter `CHECK`) gives class `23` on
+  every apply, so the consumer dead-letters every event as `database_rejected` instead of
+  stopping, unlike a migration behind the code (class `42`). Nothing is lost, and a replay after
+  the code is replaced counts them, but the aggregates stop growing until then. Migrations must not
+  add a constraint the deployed code can violate; a guard that stops after many rejections in a
+  row was considered and left out of slice 3.
 
 ## Alternatives considered
 

@@ -26,8 +26,9 @@ Phases 1 (event contract), 2 (ingest), 3 (consumer and durable aggregate), 4 (la
   logged as `conflicting_duplicate` and not counted (ADR 0004, phase 5 update).
 - `GET /stores/{store_id}/aggregates` reads the aggregates from PostgreSQL.
 
-Messages that are not counted are kept in a `dead_letters` table (ADR 0006); database-rejected
-events, retries, replay and the failure tests come in later slices and phases; the
+Messages that are not counted, including events the database rejects, are kept in a `dead_letters`
+table, and a transient database error is retried a few times before the consumer stops (ADR 0006);
+replay and the failure tests come in later slices and phases; the
 [component table](docs/architecture.md#components) has the build order. This is a learning project,
 not a production service.
 
@@ -68,12 +69,16 @@ from `make db-revision ID=0004 NAME="what it does"`, and `EXPECTED_REVISION` in
 `src/event_pipeline/data/tables.py` must name the new head (a unit test checks it).
 
 After pulling a change that adds a migration, run `make db-migrate` before starting the API or the
-consumer. Until then `/ready` answers `migration_mismatch`, and the consumer stops on the first
-message that needs what the migration adds (for 0003, the first message it dead-letters); nothing
-is lost, and that message is redelivered when the consumer is restarted after the migration. When
-deploying, migrate first, then replace the code: `/ready` checks for exactly the revision the code
-expects, so API processes still running the old code answer `migration_mismatch` until they are
-replaced, while their ingest and query paths, and an old consumer, keep working.
+consumer. Until then `/ready` answers `migration_mismatch`, and the consumer stops, after
+`DB_APPLY_ATTEMPTS` attempts, on the first message that needs what the migration adds (for 0003,
+the first message it dead-letters); nothing is lost, and that message is redelivered when the
+consumer is restarted after the migration. When deploying, migrate first, then replace the code:
+`/ready` checks for exactly the revision the code expects, so API processes still running the old
+code answer `migration_mismatch` until they are replaced, while their ingest and query paths, and
+an old consumer, keep working. A migration must therefore never add a constraint the running code
+can violate (a `NOT NULL` column without a default, a stricter `CHECK`): the old consumer would
+get a class `23` error on every event and dead-letter them all as `database_rejected` instead of
+stopping. They are kept, not lost, and can be replayed once the new code runs.
 
 Integration tests create their own `test.<id>` topics and do not delete them; they stay in the
 Kafka data volume until it is removed.
@@ -166,10 +171,26 @@ takes longer than `CONSUMER_CLOSE_TIMEOUT_S` (10 s). A supervisor should run tha
 - Nothing reports whether a window is final. By ADR 0005 a window ending at `W_end` no longer
   changes once ingest time passes `W_end + ALLOWED_LATENESS_S` and the consumer has caught up.
 - The consumer trusts the `received_at` header: anyone who can write to the topic can set it.
-- An event the database rejects permanently (for example, revenue past the 64-bit limit) stops the
-  consumer each time it is redelivered, which blocks its partition until phase 6, slice 3
-  dead-letters it. So does any other database error, including one while writing a dead letter:
-  the offset is not committed, and a restart reads the message again.
+- An event the database rejects (SQLSTATE class `22` or `23`, for example revenue past the 64-bit
+  limit) is dead-lettered as `database_rejected`, with the error's classes and SQLSTATE as detail,
+  and the next message on its partition is processed. A class `22` or `23` error caused by a bug in
+  this project's SQL is dead-lettered the same way rather than stopping the consumer.
+- Any other database error (no connection, a timeout, a lock wait cut off by the statement
+  timeout, a missing column before `make db-migrate`) is retried up to `DB_APPLY_ATTEMPTS` times
+  (default 3, pausing 0.5 s, then 1 s, at most 2 s), each failed attempt but the last logged as a
+  WARNING; the last is the ERROR stop line. If
+  every attempt fails, or a stop is requested during a pause, the consumer stops with status `1`
+  without committing the offset, and a restart reads the message again. The same holds for writing
+  a dead letter, except that a class `22` or `23` error there is a bug and stops the consumer at
+  once.
+- With retries, one message can take up to 183 s of database time with the default timeouts (two
+  transactions, each up to three attempts of 30 s, plus the pauses). `CONSUMER_MAX_POLL_INTERVAL_MS`
+  must be at least twice that, so its default is 600 s, not librdkafka's 300 s: a consumer stuck in
+  a bug outside the database is removed from its group only after 10 minutes. While it retries, a
+  consumer does not poll, so a rebalance (a consumer joining or leaving) waits for it, up to that
+  long.
+- An error psycopg raises itself without a SQLSTATE other than a connection error (for example, a
+  value it cannot send) is a bug: the consumer stops at once, without retrying.
 - An offset commit refused because the group's membership changed (a rebalance or an eviction:
   `ILLEGAL_GENERATION`, `UNKNOWN_MEMBER_ID`, `REBALANCE_IN_PROGRESS`) is logged as a WARNING and the
   consumer goes on; the event may be redelivered and is then counted as a duplicate (ADR 0004,

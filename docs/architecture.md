@@ -56,10 +56,11 @@ Each becomes a claim only when a test proves it. So far:
   `tests/integration/test_ingest_api.py`).
 - Event time decides the window, and late or future events do not count: phases 1 and 4
   (`tests/unit/test_windows.py`, `tests/unit/test_lateness.py`, the consumer tests).
-- Poison events: only partly. Invalid, late, future and unstamped messages and conflicting
-  duplicates are dead-lettered before their offset moves on (`tests/unit/test_consumer_loop.py`,
-  `tests/integration/test_consumer.py`); an event the database rejects permanently still stops the
-  consumer until phase 6, slice 3.
+- Poison events: phase 6. Invalid, late, future and unstamped messages, conflicting duplicates and
+  events the database rejects (SQLSTATE class 22 or 23) are dead-lettered before their offset moves
+  on, and the next message on the partition is processed; a transient database error is retried,
+  then stops the consumer without committing (`tests/unit/test_consumer_loop.py`,
+  `tests/unit/test_db_errors.py`, `tests/integration/test_consumer.py`). Replay is not built yet.
 
 ## Consume, apply, commit
 
@@ -87,6 +88,7 @@ sequenceDiagram
     end
     Note over C: crash point A (anywhere before COMMIT)
     C->>DB: COMMIT
+    Note over C: database error, rolled back: class 22/23 is a database_rejected dead letter; any other is retried up to DB_APPLY_ATTEMPTS, then the consumer stops without committing
     Note over C: conflicting_duplicate: dead letter in its own transaction, as above
     Note over C: crash point B
     C->>K: commit offset n + 1 for partition p
@@ -130,10 +132,10 @@ business rules.
 | PostgreSQL in Docker Compose (`make up`) | Local database and the `_test` database for integration tests | 3 | Built |
 | `data/` tables and migrations | `order_aggregates` and `processed_events`; Alembic revision 0001 with CHECKs from the contract, 0002 adds each event's fingerprint, 0003 the `dead_letters` table (`make db-migrate`) | 3, 5, 6 | Built |
 | `services/` apply (`apply_order_placed`) | Deduplicate by `event_id` and upsert the aggregate in one transaction; a duplicate changes nothing, one with a different fingerprint is reported as a conflicting duplicate; any database error rolls back both | 3, 5 | Built |
-| `consumer/` (`make consumer`) | Poll loop; offset committed synchronously after the apply transaction; a message that is not counted is dead-lettered first (ADR 0006); any other failure stops the process without committing; SIGTERM finishes the current event | 3, 6 | Built |
+| `consumer/` (`make consumer`) | Poll loop; offset committed synchronously after the apply transaction; a message that is not counted is dead-lettered first (ADR 0006); a transient database error is retried up to `DB_APPLY_ATTEMPTS` times; any other failure stops the process without committing; SIGTERM finishes the current event | 3, 6 | Built |
 | Query API (`GET /stores/{store_id}/aggregates`) | Read a store's aggregates in `[from, to)` from PostgreSQL only; parameters validated with the contract's rules and reason codes | 3 | Built |
 | Late-event policy (`domain/lateness.py`) | An event counts only if `received_at − occurred_at` ≤ `ALLOWED_LATENESS_S`; the consumer skips late, future and unstamped events (dead-lettered and logged, offset committed); ingest rejects events from the future (ADR 0005) | 4 | Built |
 | Restart and rebalance handling | Restart resumes at the committed offset (tested); `cooperative-sticky` assignment; an offset commit refused by a membership change is a WARNING, not a failure; assignments and revocations logged (ADR 0004, decisions 9-12) | 5 | Built |
-| Dead-letter path and replay | `dead_letters` table, written before the offset commit for invalid, late, future, unstamped and conflicting messages (built); database-rejected events, transient retry and replay (not built yet) | 6 | Partly built |
+| Dead-letter path and replay | `dead_letters` table, written before the offset commit for invalid, late, future, unstamped, conflicting and database-rejected messages; transient database errors retried in place (`data/errors.py` classifies by SQLSTATE) (built); replay (not built yet) | 6 | Partly built |
 | Failure tests | Process kill, database down, broker down | 7 | Not built |
 | Guarantee and limitation docs, measurements | Written guarantees and a repeatable measurement script | 8 | Not built |
