@@ -1,5 +1,5 @@
 """The consumer against real Kafka and PostgreSQL (phase 3 criteria 5 and 6, phase 5 criterion 2,
-phase 6 criteria 3 to 6).
+phase 6 criteria 3 to 6, phase 7 criteria 3 to 7).
 
 Each test has its own topic, consumer group and store ids, so tests never share offsets or rows.
 """
@@ -22,7 +22,7 @@ import pytest
 from confluent_kafka import Consumer, KafkaError, KafkaException, Message, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient
 from pydantic import SecretStr
-from sqlalchemy import Connection, Engine, event, func, select, text
+from sqlalchemy import Connection, Engine, event, func, make_url, select, text
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from event_pipeline.broker.config import consumer_config, producer_config
@@ -40,6 +40,7 @@ from event_pipeline.domain.windows import window_start
 from event_pipeline.services.aggregation import ApplyOutcome, apply_order_placed
 from event_pipeline.services.dead_letters import store_dead_letter
 from tests.api.helpers import make_app
+from tests.integration.fault_proxy import FaultProxy
 from tests.integration.test_ingest_api import post_event
 from tests.samples import encode, valid_event
 
@@ -1541,3 +1542,199 @@ def test_sigkill_inside_the_transaction_rolls_it_back_and_the_restart_applies_it
     assert applied(migrated_engine, [uuid.UUID(body["event_id"])]) == 1
     assert counts(migrated_engine, store_id) == [("EUR", 2, 6)]
     assert dead_lettered(migrated_engine, settings.events_topic) == []
+
+
+# --- The database down during apply, through a fault proxy (phase 7 criteria 5 to 7) --------------
+
+# The simple-query message psycopg sends for COMMIT: "Q", length 11, "COMMIT\0" (checked against the
+# real driver when this test was written).
+COMMIT_MESSAGE = b"Q\x00\x00\x00\x0bCOMMIT\x00"
+# The start of the aggregate upsert's text (data/aggregates.py). psycopg sends it in a Parse message
+# each time until the statement has run often enough to be prepared (5 times), then never again: so
+# armed only on a fresh engine. A marker that does not match fails the test (`fired`), it does not
+# pass it.
+UPSERT_TEXT = b"INSERT INTO order_aggregates"
+
+
+@pytest.fixture
+def db_proxy(test_database_url: SecretStr) -> Iterator[FaultProxy]:
+    url = make_url(test_database_url.get_secret_value())
+    # No defaults: a URL without them would put the proxy in front of whatever listens on 5432.
+    assert url.host and url.port, "TEST_DATABASE_URL must name a host and a port for the proxy"
+    with FaultProxy(url.host, url.port) as proxy:
+        yield proxy
+
+
+def through(proxy: FaultProxy, database_url: SecretStr) -> SecretStr:
+    """`database_url` with the proxy in place of the server."""
+    url = make_url(database_url.get_secret_value()).set(host=proxy.host, port=proxy.port)
+    return SecretStr(url.render_as_string(hide_password=False))
+
+
+def proxied_settings(proxy: FaultProxy, database_url: SecretStr) -> Settings:
+    return Settings(_env_file=None, database_url=through(proxy, database_url))  # type: ignore[call-arg]
+
+
+def test_database_refusing_connections_stops_the_process_and_a_restart_applies_once(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    tmp_path: Path,
+    processes: list[ConsumerProcess],
+    db_proxy: FaultProxy,
+) -> None:
+    # The server goes away mid-stream: open connections die, new ones are refused. The event that
+    # arrives meanwhile is retried, then the process stops without committing its offset; once the
+    # server is back, a restart applies it. Event 1's offset stayed committed through the outage.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    first = event_body(store_id, amount_minor=4)
+    second = event_body(store_id, amount_minor=40)
+    produce(settings, encode(first), key=store_id.encode())
+    consumer = ConsumerProcess(settings, through(db_proxy, test_database_url), tmp_path)
+    processes.append(consumer)
+    consumer.wait_for(lambda: committed_offsets(settings) == end_offsets(settings), "event 1")
+    before_outage = committed_offsets(settings)
+
+    db_proxy.refuse()
+    db_proxy.cut()
+    produce(settings, encode(second), key=store_id.encode())
+    status = consumer.finish()
+
+    assert status == 1, consumer.output
+    errors = [line for line in consumer.output.splitlines() if " ERROR " in line]
+    assert len(errors) == 1, consumer.output
+    assert "OperationalError" in errors[0]
+    assert errors[0].endswith("; apply failed 3 of 3 attempts"), consumer.output
+    assert committed_offsets(settings) == before_outage
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 4)]
+    assert store_id not in consumer.output
+    assert PAYLOAD_MARKER not in consumer.output
+
+    db_proxy.forward()
+    restarted = ConsumerProcess(settings, through(db_proxy, test_database_url), tmp_path)
+    processes.append(restarted)
+    restarted.wait_for(lambda: committed_offsets(settings) == end_offsets(settings), "event 2")
+    restarted.process.send_signal(signal.SIGTERM)
+    assert restarted.finish() == 0, restarted.output
+
+    assert counts(migrated_engine, store_id) == [("EUR", 2, 44)]
+    ids = [uuid.UUID(first["event_id"]), uuid.UUID(second["event_id"])]
+    assert applied(migrated_engine, ids) == 2
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+
+
+def test_connection_cut_inside_the_transaction_rolls_back_and_the_retry_applies_once(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    running: list[RunningConsumer],
+    db_proxy: FaultProxy,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The connection dies after the processed_events insert, before the upsert reaches the server.
+    # The server rolls the insert back; had it kept it, the retry would see a duplicate and the
+    # event would never be counted.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    body = event_body(store_id, amount_minor=4)
+    produce(settings, encode(body), key=store_id.encode())
+    fired = db_proxy.cut_on(UPSERT_TEXT, forward=False)
+    engine = make_engine(proxied_settings(db_proxy, test_database_url))
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+            consumer = RunningConsumer(settings, engine)
+            running.append(consumer)
+            wait_for(
+                lambda: committed_offsets(settings) == end_offsets(settings),
+                "the offset",
+                watching=[consumer],
+            )
+    finally:
+        engine.dispose()
+
+    assert fired.is_set()
+    assert consumer.outcomes == [ApplyOutcome.APPLIED]
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 4)]
+    assert applied(migrated_engine, [uuid.UUID(body["event_id"])]) == 1
+    [warning] = retry_warnings(caplog)
+    assert "(attempt 1 of 3): OperationalError" in warning
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+def test_lost_commit_answer_is_retried_as_a_duplicate_and_counted_once(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    running: list[RunningConsumer],
+    db_proxy: FaultProxy,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # COMMIT reaches the server and commits; the answer is lost, so the client cannot know. The
+    # retry finds the event in processed_events (written in the same transaction) and changes
+    # nothing: the ambiguity costs a duplicate, never a double count.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    body = event_body(store_id, amount_minor=4)
+    produce(settings, encode(body), key=store_id.encode())
+    fired = db_proxy.cut_on(COMMIT_MESSAGE, forward=True)
+    engine = make_engine(proxied_settings(db_proxy, test_database_url))
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+            consumer = RunningConsumer(settings, engine)
+            running.append(consumer)
+            wait_for(
+                lambda: committed_offsets(settings) == end_offsets(settings),
+                "the offset",
+                watching=[consumer],
+            )
+    finally:
+        engine.dispose()
+
+    assert fired.is_set()
+    # The first attempt raised (no outcome); the second found the committed first one.
+    assert consumer.outcomes == [ApplyOutcome.DUPLICATE]
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 4)]
+    assert applied(migrated_engine, [uuid.UUID(body["event_id"])]) == 1
+    [warning] = retry_warnings(caplog)
+    assert "(attempt 1 of 3): OperationalError" in warning
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+def test_a_pooled_connection_dead_since_its_last_use_is_replaced_without_a_retry(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    running: list[RunningConsumer],
+    db_proxy: FaultProxy,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The server restarted between two events: the pooled connection is dead, new ones work. The
+    # pool's pre-ping (data/engine.py) finds that out on checkout and opens a new one, so the event
+    # neither fails an attempt nor logs a retry.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    engine = make_engine(proxied_settings(db_proxy, test_database_url))
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+            consumer = RunningConsumer(settings, engine)
+            running.append(consumer)
+            produce(settings, encode(event_body(store_id, amount_minor=4)), key=store_id.encode())
+            wait_for(
+                lambda: committed_offsets(settings) == end_offsets(settings),
+                "event 1",
+                watching=[consumer],
+            )
+            assert db_proxy.open_connections == 1
+
+            db_proxy.cut()
+            produce(settings, encode(event_body(store_id, amount_minor=40)), key=store_id.encode())
+            wait_for(
+                lambda: committed_offsets(settings) == end_offsets(settings),
+                "event 2",
+                watching=[consumer],
+            )
+    finally:
+        engine.dispose()
+
+    assert consumer.outcomes == [ApplyOutcome.APPLIED, ApplyOutcome.APPLIED]
+    assert retry_warnings(caplog) == []
+    assert counts(migrated_engine, store_id) == [("EUR", 2, 44)]
