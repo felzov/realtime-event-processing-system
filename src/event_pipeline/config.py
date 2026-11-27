@@ -50,8 +50,12 @@ DB_RETRY_FIRST_BACKOFF_S = 0.5
 DB_RETRY_MAX_BACKOFF_S = 2.0
 # How many times that worst case must fit into max.poll.interval.ms, so it stays well under it.
 POLL_INTERVAL_MARGIN = 2
-# librdkafka's default session.timeout.ms, which max.poll.interval.ms may not be below.
-LIBRDKAFKA_SESSION_TIMEOUT_MS = 45_000
+# The broker's default group.min/max.session.timeout.ms (Kafka 4.3.2, read in the phase 7 spike).
+# A consumer asking for less never joins its group: the broker answers INVALID_SESSION_TIMEOUT,
+# which librdkafka reports as a non-fatal error and retries for ever, so the process runs with no
+# partitions. Refused at load instead.
+BROKER_MIN_SESSION_TIMEOUT_MS = 6_000
+BROKER_MAX_SESSION_TIMEOUT_MS = 1_800_000
 
 
 class Settings(BaseSettings):
@@ -131,6 +135,15 @@ class Settings(BaseSettings):
     # 300 s: with the database defaults and retries, one message can take 183 s (see the
     # validator), and the validator wants twice that.
     consumer_max_poll_interval_ms: int = Field(default=600_000, gt=0)
+    # librdkafka's session.timeout.ms: a consumer the broker hears nothing from for this long is
+    # removed from the group, and its partitions move to the others. A clean stop leaves the group
+    # at once; a killed process (SIGKILL, a crash, a lost machine) holds its partitions until this
+    # runs out: 45.0 s with the default, 6.0 s with 6000, measured in the phase 7 spike. Shorter
+    # means faster recovery after a crash, but a consumer that misses heartbeats that long (a
+    # network blip, a stalled host) is removed although alive. The default is librdkafka's.
+    consumer_session_timeout_ms: int = Field(
+        default=45_000, ge=BROKER_MIN_SESSION_TIMEOUT_MS, le=BROKER_MAX_SESSION_TIMEOUT_MS
+    )
     # From a stop request to the process exiting: finishing the current event, leaving the group.
     # Past it the process exits anyway, with an error status (consumer/__main__.py).
     consumer_close_timeout_s: float = Field(default=10.0, gt=0)
@@ -186,12 +199,11 @@ class Settings(BaseSettings):
             + self.db_retry_policy().total_backoff_s() * 1000
         )
         message_bound_ms = DB_TRANSACTIONS_PER_MESSAGE * retried_bound_ms
-        if self.consumer_max_poll_interval_ms < LIBRDKAFKA_SESSION_TIMEOUT_MS:
-            # librdkafka refuses to create a consumer otherwise (session.timeout.ms is left at its
-            # default).
+        if self.consumer_max_poll_interval_ms < self.consumer_session_timeout_ms:
+            # librdkafka refuses to create a consumer otherwise.
             raise ValueError(
-                f"consumer_max_poll_interval_ms must be at least {LIBRDKAFKA_SESSION_TIMEOUT_MS} "
-                "(librdkafka's session.timeout.ms)"
+                "consumer_max_poll_interval_ms must be at least "
+                f"consumer_session_timeout_ms ({self.consumer_session_timeout_ms})"
             )
         if self.consumer_max_poll_interval_ms < POLL_INTERVAL_MARGIN * message_bound_ms:
             raise ValueError(

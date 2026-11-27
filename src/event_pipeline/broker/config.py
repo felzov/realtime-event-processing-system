@@ -38,6 +38,7 @@ def consumer_config(settings: Settings) -> ClientConfig:
     - `cooperative-sticky`: a rebalance stops only the partitions that move to another consumer
       (decision 9). Every consumer of a group must use the same strategy: stop the old ones before
       switching, or the new one gets INCONSISTENT_GROUP_PROTOCOL and stops.
+    - `session.timeout.ms`: how long a killed consumer keeps its partitions (`Settings`).
     """
     return {
         "bootstrap.servers": settings.kafka_bootstrap_servers,
@@ -45,5 +46,6 @@ def consumer_config(settings: Settings) -> ClientConfig:
         "enable.auto.commit": False,
         "auto.offset.reset": "earliest",
         "max.poll.interval.ms": settings.consumer_max_poll_interval_ms,
+        "session.timeout.ms": settings.consumer_session_timeout_ms,
         "partition.assignment.strategy": "cooperative-sticky",
     }
