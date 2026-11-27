@@ -1,9 +1,10 @@
 """The consumer against real Kafka and PostgreSQL (phase 3 criteria 5 and 6, phase 5 criterion 2,
-phase 6 criteria 3 to 6).
+phase 6 criteria 3 to 6, phase 7 criteria 3 to 7).
 
 Each test has its own topic, consumer group and store ids, so tests never share offsets or rows.
 """
 
+import itertools
 import logging
 import os
 import signal
@@ -21,7 +22,7 @@ import pytest
 from confluent_kafka import Consumer, KafkaError, KafkaException, Message, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient
 from pydantic import SecretStr
-from sqlalchemy import Connection, Engine, event, func, select, text
+from sqlalchemy import Connection, Engine, event, func, make_url, select, text
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from event_pipeline.broker.config import consumer_config, producer_config
@@ -39,6 +40,7 @@ from event_pipeline.domain.windows import window_start
 from event_pipeline.services.aggregation import ApplyOutcome, apply_order_placed
 from event_pipeline.services.dead_letters import store_dead_letter
 from tests.api.helpers import make_app
+from tests.integration.fault_proxy import FaultProxy
 from tests.integration.test_ingest_api import post_event
 from tests.samples import encode, valid_event
 
@@ -1044,6 +1046,13 @@ class ConsumerProcess:
     def alive(self) -> bool:
         return self.process.poll() is None
 
+    def kill(self) -> None:
+        """SIGKILL: no handler, no `finally`, no close(); the group still counts the member until
+        its session timeout runs out."""
+        self.process.send_signal(signal.SIGKILL)
+        self.output, _ = self.process.communicate(timeout=TIMEOUT_S)
+        assert self.process.returncode == -signal.SIGKILL, self.output
+
     def finish(self, timeout_s: float = CLOSE_TIMEOUT_S + 5) -> int:
         """Wait for the exit (killing it after `timeout_s`) and return its status."""
         try:
@@ -1054,8 +1063,10 @@ class ConsumerProcess:
             pytest.fail(f"the consumer process did not exit:\n{self.output}")
         return self.process.returncode
 
-    def wait_for(self, condition: Callable[[], bool], what: str) -> None:
-        deadline = time.monotonic() + TIMEOUT_S
+    def wait_for(
+        self, condition: Callable[[], bool], what: str, *, timeout_s: float = TIMEOUT_S
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
         while not condition():
             if not self.alive() or time.monotonic() > deadline:
                 status = self.finish(timeout_s=1)
@@ -1084,7 +1095,18 @@ def group_members(settings: Settings) -> int:
 
 
 def blocked_by(engine: Engine, pid: int) -> bool:
-    query = text("SELECT count(*) FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid))")
+    return blocked_pids(engine, pid) != []
+
+
+def blocked_pids(engine: Engine, pid: int) -> list[int]:
+    """The backends waiting on a lock that backend `pid` holds."""
+    query = text("SELECT pid FROM pg_stat_activity WHERE :pid = ANY(pg_blocking_pids(pid))")
+    with engine.connect() as connection:
+        return list(connection.execute(query, {"pid": pid}).scalars())
+
+
+def backend_exists(engine: Engine, pid: int) -> bool:
+    query = text("SELECT count(*) FROM pg_stat_activity WHERE pid = :pid")
     with engine.connect() as connection:
         return bool(connection.execute(query, {"pid": pid}).scalar_one())
 
@@ -1313,3 +1335,406 @@ def test_sigterm_during_a_retry_pause_stops_at_once_with_status_1(
     assert group_members(settings) == 0
     assert store_id not in consumer.output
     assert PAYLOAD_MARKER not in consumer.output
+
+
+# --- The process killed: SIGKILL (phase 7 criteria 3 and 4) ---------------------------------------
+
+# The broker's minimum. A killed process's partitions go to its successor once this runs out:
+# 6.0 s here against 45.0 s with the default (phase 7 spike).
+KILL_SESSION_TIMEOUT_MS = "6000"
+# A process started after a kill first waits for the killed member's session to run out, so its
+# waits get that on top of the usual budget.
+KILL_TIMEOUT_S = TIMEOUT_S + int(KILL_SESSION_TIMEOUT_MS) / 1000
+KILLS = 3
+EVENTS_PER_ROUND = 200
+# How long a frozen process is given for requests it sent before the freeze to be answered, so the
+# broker's and the database's state no longer move while the test reads them. A commit answered
+# later still is caught by settled_commit() after the kill.
+SETTLE_S = 0.2
+# Two reads of a dead group's committed offset this far apart that agree: nothing is in flight.
+COMMIT_SETTLE_S = 0.5
+
+
+def applied(engine: Engine, event_ids: Sequence[uuid.UUID]) -> int:
+    """How many of `event_ids` are in processed_events: applied, each exactly once (its PK)."""
+    query = (
+        select(func.count())
+        .select_from(processed_events)
+        .where(processed_events.c.event_id.in_(event_ids))
+    )
+    with engine.connect() as connection:
+        return int(connection.execute(query).scalar_one())
+
+
+def settled_commit(settings: Settings) -> int:
+    """Partition 0's committed offset once it stopped moving: after a kill, a commit request the
+    process sent before it died may still be answered."""
+    deadline = time.monotonic() + TIMEOUT_S
+    last = committed_offsets(settings).get(0, 0)
+    while True:
+        time.sleep(COMMIT_SETTLE_S)
+        current = committed_offsets(settings).get(0, 0)
+        if current == last:
+            return current
+        if time.monotonic() > deadline:
+            pytest.fail("the committed offset kept moving after the kill")
+        last = current
+
+
+def freeze_at_crash_point_b(
+    consumer: ConsumerProcess,
+    settings: Settings,
+    engine: Engine,
+    event_ids: Sequence[uuid.UUID],
+) -> None:
+    """Leave `consumer` stopped (SIGSTOP) at crash point B: an event's transaction committed, its
+    offset not. Every event is on partition 0, so that is "more applied than committed".
+
+    The window is one offset-commit round trip per event, too short to hit with a kill at a random
+    moment (a version of this test that did so passed with deduplication switched off). So the
+    process is frozen at varying moments and the two systems compared until the state is found.
+    Probing starts once the process is applying events: frozen most of the time, it would barely
+    get through its start-up and group join.
+    """
+    before = applied(engine, event_ids)
+    consumer.wait_for(
+        lambda: applied(engine, event_ids) > before,
+        "the process to apply events",
+        timeout_s=KILL_TIMEOUT_S,
+    )
+    jitter_s = itertools.cycle([0.0, 0.003, 0.007, 0.011, 0.017])
+    deadline = time.monotonic() + TIMEOUT_S
+    while True:
+        if not consumer.alive() or time.monotonic() > deadline:
+            status = consumer.finish(timeout_s=1)
+            pytest.fail(f"crash point B not reached; process status {status}:\n{consumer.output}")
+        time.sleep(next(jitter_s))
+        consumer.process.send_signal(signal.SIGSTOP)
+        time.sleep(SETTLE_S)
+        done, committed = applied(engine, event_ids), committed_offsets(settings).get(0, 0)
+        if committed > done:
+            # Every message here is a valid, on-time event, so each committed offset needs its
+            # applied event: a kill now would lose one.
+            pytest.fail(f"offset ahead of the database: {committed} committed, {done} applied")
+        if done > committed:
+            return
+        if done == len(event_ids):
+            pytest.fail("the stream was used up before crash point B was found")
+        consumer.process.send_signal(signal.SIGCONT)
+
+
+def test_sigkill_at_crash_point_b_redelivers_and_every_aggregate_stays_exact(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    tmp_path: Path,
+    processes: list[ConsumerProcess],
+) -> None:
+    # Each round adds events, starts a process and kills it at crash point B. The event applied
+    # but not committed is redelivered to the next process, and the duplicates table keeps it from
+    # counting twice. The last process runs to the end of the topic.
+    stores = [f"store-{uuid.uuid4().hex[:8]}" for _ in range(6)]
+    expected = dict.fromkeys(stores, (0, 0))
+    event_ids: list[uuid.UUID] = []
+    producer = Producer(producer_config(settings))
+    headers: Headers = [(RECEIVED_AT_HEADER, format_received_at(RECEIVED_AT))]
+
+    for round_ in range(KILLS + 1):
+        for i in range(EVENTS_PER_ROUND):
+            store_id = stores[i % len(stores)]
+            amount = round_ * 1000 + i + 1
+            body = event_body(store_id, amount_minor=amount)
+            event_ids.append(uuid.UUID(body["event_id"]))
+            count, revenue = expected[store_id]
+            expected[store_id] = (count + 1, revenue + amount)
+            producer.produce(
+                settings.events_topic,
+                value=encode(body),
+                key=store_id.encode(),
+                headers=headers,
+                partition=0,
+            )
+        assert producer.flush(TIMEOUT_S) == 0
+
+        consumer = ConsumerProcess(
+            settings,
+            test_database_url,
+            tmp_path,
+            CONSUMER_SESSION_TIMEOUT_MS=KILL_SESSION_TIMEOUT_MS,
+        )
+        processes.append(consumer)
+        if round_ == KILLS:
+            break
+        freeze_at_crash_point_b(consumer, settings, migrated_engine, event_ids)
+        consumer.kill()
+        # Still true after the kill: the next process starts from the uncommitted offset.
+        assert applied(migrated_engine, event_ids) > settled_commit(settings)
+
+    consumer.wait_for(
+        lambda: committed_offsets(settings) == end_offsets(settings),
+        "every offset committed",
+        timeout_s=KILL_TIMEOUT_S,
+    )
+    consumer.process.send_signal(signal.SIGTERM)
+    assert consumer.finish() == 0, consumer.output
+
+    assert applied(migrated_engine, event_ids) == len(event_ids)
+    for store_id in stores:
+        count, revenue = expected[store_id]
+        assert counts(migrated_engine, store_id) == [("EUR", count, revenue)], store_id
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+    assert PAYLOAD_MARKER not in consumer.output
+
+
+def test_sigkill_inside_the_transaction_rolls_it_back_and_the_restart_applies_it_once(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    tmp_path: Path,
+    processes: list[ConsumerProcess],
+    row_lock: Callable[[str], tuple[Connection, int]],
+) -> None:
+    # The process dies with its transaction open: processed_events row inserted, the upsert waiting
+    # on the test's row lock. Nothing was committed, so nothing of it may remain.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    blocker, blocker_pid = row_lock(store_id)
+    body = event_body(store_id, amount_minor=4)
+    produce(settings, encode(body), key=store_id.encode())
+    first = ConsumerProcess(
+        settings,
+        test_database_url,
+        tmp_path,
+        CONSUMER_SESSION_TIMEOUT_MS=KILL_SESSION_TIMEOUT_MS,
+        # The orphan below waits on the lock until its statement timeout cancels the upsert; 30 s
+        # keeps it waiting through the test's steps on a slow machine. One attempt, so the 30 s
+        # stays within the default max.poll.interval's bound.
+        DB_STATEMENT_TIMEOUT_MS="30000",
+        DB_APPLY_ATTEMPTS="1",
+    )
+    processes.append(first)
+    first.wait_for(lambda: blocked_by(migrated_engine, blocker_pid), "the upsert to wait")
+
+    first.kill()
+    # PostgreSQL does not notice a dead client while its backend waits on a lock: the orphaned
+    # transaction keeps waiting (bounded by its statement timeout) and holds its uncommitted
+    # processed_events row meanwhile.
+    [orphan_pid] = blocked_pids(migrated_engine, blocker_pid)
+    blocker.commit()
+    # The orphan runs its upsert once the lock is gone, then finds its client gone and ends; it
+    # never received a COMMIT. Checked after it ended: before, its rows would be invisible anyway.
+    wait_for(lambda: not backend_exists(migrated_engine, orphan_pid), "the orphan to end")
+    assert applied(migrated_engine, [uuid.UUID(body["event_id"])]) == 0
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 2)]  # the blocker's row only
+    assert committed_offsets(settings) == {}
+
+    second = ConsumerProcess(
+        settings, test_database_url, tmp_path, CONSUMER_SESSION_TIMEOUT_MS=KILL_SESSION_TIMEOUT_MS
+    )
+    processes.append(second)
+    second.wait_for(
+        lambda: committed_offsets(settings) == end_offsets(settings),
+        "the offset",
+        timeout_s=KILL_TIMEOUT_S,
+    )
+    second.process.send_signal(signal.SIGTERM)
+    assert second.finish() == 0, second.output
+
+    assert applied(migrated_engine, [uuid.UUID(body["event_id"])]) == 1
+    assert counts(migrated_engine, store_id) == [("EUR", 2, 6)]
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+
+
+# --- The database down during apply, through a fault proxy (phase 7 criteria 5 to 7) --------------
+
+# The simple-query message psycopg sends for COMMIT: "Q", length 11, "COMMIT\0" (checked against the
+# real driver when this test was written).
+COMMIT_MESSAGE = b"Q\x00\x00\x00\x0bCOMMIT\x00"
+# The start of the aggregate upsert's text (data/aggregates.py). psycopg sends it in a Parse message
+# each time until the statement has run often enough to be prepared (5 times), then never again: so
+# armed only on a fresh engine. A marker that does not match fails the test (`fired`), it does not
+# pass it.
+UPSERT_TEXT = b"INSERT INTO order_aggregates"
+
+
+@pytest.fixture
+def db_proxy(test_database_url: SecretStr) -> Iterator[FaultProxy]:
+    url = make_url(test_database_url.get_secret_value())
+    # No defaults: a URL without them would put the proxy in front of whatever listens on 5432.
+    assert url.host and url.port, "TEST_DATABASE_URL must name a host and a port for the proxy"
+    with FaultProxy(url.host, url.port) as proxy:
+        yield proxy
+
+
+def through(proxy: FaultProxy, database_url: SecretStr) -> SecretStr:
+    """`database_url` with the proxy in place of the server."""
+    url = make_url(database_url.get_secret_value()).set(host=proxy.host, port=proxy.port)
+    return SecretStr(url.render_as_string(hide_password=False))
+
+
+def proxied_settings(proxy: FaultProxy, database_url: SecretStr) -> Settings:
+    return Settings(_env_file=None, database_url=through(proxy, database_url))  # type: ignore[call-arg]
+
+
+def test_database_refusing_connections_stops_the_process_and_a_restart_applies_once(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    tmp_path: Path,
+    processes: list[ConsumerProcess],
+    db_proxy: FaultProxy,
+) -> None:
+    # The server goes away mid-stream: open connections die, new ones are refused. The event that
+    # arrives meanwhile is retried, then the process stops without committing its offset; once the
+    # server is back, a restart applies it. Event 1's offset stayed committed through the outage.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    first = event_body(store_id, amount_minor=4)
+    second = event_body(store_id, amount_minor=40)
+    produce(settings, encode(first), key=store_id.encode())
+    consumer = ConsumerProcess(settings, through(db_proxy, test_database_url), tmp_path)
+    processes.append(consumer)
+    consumer.wait_for(lambda: committed_offsets(settings) == end_offsets(settings), "event 1")
+    before_outage = committed_offsets(settings)
+
+    db_proxy.refuse()
+    db_proxy.cut()
+    produce(settings, encode(second), key=store_id.encode())
+    status = consumer.finish()
+
+    assert status == 1, consumer.output
+    errors = [line for line in consumer.output.splitlines() if " ERROR " in line]
+    assert len(errors) == 1, consumer.output
+    assert "OperationalError" in errors[0]
+    assert errors[0].endswith("; apply failed 3 of 3 attempts"), consumer.output
+    assert committed_offsets(settings) == before_outage
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 4)]
+    assert store_id not in consumer.output
+    assert PAYLOAD_MARKER not in consumer.output
+
+    db_proxy.forward()
+    restarted = ConsumerProcess(settings, through(db_proxy, test_database_url), tmp_path)
+    processes.append(restarted)
+    restarted.wait_for(lambda: committed_offsets(settings) == end_offsets(settings), "event 2")
+    restarted.process.send_signal(signal.SIGTERM)
+    assert restarted.finish() == 0, restarted.output
+
+    assert counts(migrated_engine, store_id) == [("EUR", 2, 44)]
+    ids = [uuid.UUID(first["event_id"]), uuid.UUID(second["event_id"])]
+    assert applied(migrated_engine, ids) == 2
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+
+
+def test_connection_cut_inside_the_transaction_rolls_back_and_the_retry_applies_once(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    running: list[RunningConsumer],
+    db_proxy: FaultProxy,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The connection dies after the processed_events insert, before the upsert reaches the server.
+    # The server rolls the insert back; had it kept it, the retry would see a duplicate and the
+    # event would never be counted.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    body = event_body(store_id, amount_minor=4)
+    produce(settings, encode(body), key=store_id.encode())
+    fired = db_proxy.cut_on(UPSERT_TEXT, forward=False)
+    engine = make_engine(proxied_settings(db_proxy, test_database_url))
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+            consumer = RunningConsumer(settings, engine)
+            running.append(consumer)
+            wait_for(
+                lambda: committed_offsets(settings) == end_offsets(settings),
+                "the offset",
+                watching=[consumer],
+            )
+    finally:
+        engine.dispose()
+
+    assert fired.is_set()
+    assert consumer.outcomes == [ApplyOutcome.APPLIED]
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 4)]
+    assert applied(migrated_engine, [uuid.UUID(body["event_id"])]) == 1
+    [warning] = retry_warnings(caplog)
+    assert "(attempt 1 of 3): OperationalError" in warning
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+def test_lost_commit_answer_is_retried_as_a_duplicate_and_counted_once(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    running: list[RunningConsumer],
+    db_proxy: FaultProxy,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # COMMIT reaches the server and commits; the answer is lost, so the client cannot know. The
+    # retry finds the event in processed_events (written in the same transaction) and changes
+    # nothing: the ambiguity costs a duplicate, never a double count.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    body = event_body(store_id, amount_minor=4)
+    produce(settings, encode(body), key=store_id.encode())
+    fired = db_proxy.cut_on(COMMIT_MESSAGE, forward=True)
+    engine = make_engine(proxied_settings(db_proxy, test_database_url))
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+            consumer = RunningConsumer(settings, engine)
+            running.append(consumer)
+            wait_for(
+                lambda: committed_offsets(settings) == end_offsets(settings),
+                "the offset",
+                watching=[consumer],
+            )
+    finally:
+        engine.dispose()
+
+    assert fired.is_set()
+    # The first attempt raised (no outcome); the second found the committed first one.
+    assert consumer.outcomes == [ApplyOutcome.DUPLICATE]
+    assert counts(migrated_engine, store_id) == [("EUR", 1, 4)]
+    assert applied(migrated_engine, [uuid.UUID(body["event_id"])]) == 1
+    [warning] = retry_warnings(caplog)
+    assert "(attempt 1 of 3): OperationalError" in warning
+    assert dead_lettered(migrated_engine, settings.events_topic) == []
+    assert PAYLOAD_MARKER not in caplog.text
+
+
+def test_a_pooled_connection_dead_since_its_last_use_is_replaced_without_a_retry(
+    settings: Settings,
+    migrated_engine: Engine,
+    test_database_url: SecretStr,
+    running: list[RunningConsumer],
+    db_proxy: FaultProxy,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The server restarted between two events: the pooled connection is dead, new ones work. The
+    # pool's pre-ping (data/engine.py) finds that out on checkout and opens a new one, so the event
+    # neither fails an attempt nor logs a retry.
+    store_id = f"store-{uuid.uuid4().hex[:8]}"
+    engine = make_engine(proxied_settings(db_proxy, test_database_url))
+    try:
+        with caplog.at_level(logging.WARNING, logger="event_pipeline.consumer.loop"):
+            consumer = RunningConsumer(settings, engine)
+            running.append(consumer)
+            produce(settings, encode(event_body(store_id, amount_minor=4)), key=store_id.encode())
+            wait_for(
+                lambda: committed_offsets(settings) == end_offsets(settings),
+                "event 1",
+                watching=[consumer],
+            )
+            assert db_proxy.open_connections == 1
+
+            db_proxy.cut()
+            produce(settings, encode(event_body(store_id, amount_minor=40)), key=store_id.encode())
+            wait_for(
+                lambda: committed_offsets(settings) == end_offsets(settings),
+                "event 2",
+                watching=[consumer],
+            )
+    finally:
+        engine.dispose()
+
+    assert consumer.outcomes == [ApplyOutcome.APPLIED, ApplyOutcome.APPLIED]
+    assert retry_warnings(caplog) == []
+    assert counts(migrated_engine, store_id) == [("EUR", 2, 44)]

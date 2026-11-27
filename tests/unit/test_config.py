@@ -177,8 +177,42 @@ def test_consumer_config_sets_the_adr_0004_offset_policy_and_strategy() -> None:
         "enable.auto.commit": False,
         "auto.offset.reset": "earliest",
         "max.poll.interval.ms": 480_000,
+        "session.timeout.ms": 45_000,
         "partition.assignment.strategy": "cooperative-sticky",
     }
+
+
+def test_consumer_config_passes_the_session_timeout() -> None:
+    config = consumer_config(make_settings(consumer_session_timeout_ms=6_000))
+
+    assert config["session.timeout.ms"] == 6_000
+
+
+@pytest.mark.parametrize("value", [6_000, 1_800_000], ids=["broker_minimum", "broker_maximum"])
+def test_session_timeout_within_the_broker_range_is_accepted(value: int) -> None:
+    settings = make_settings(
+        consumer_session_timeout_ms=value, consumer_max_poll_interval_ms=max(value, 600_000)
+    )
+
+    # Creating the client validates the configuration; it does not connect.
+    Consumer(consumer_config(settings)).close()
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (0, "greater than or equal to 6000"),
+        (5_999, "greater than or equal to 6000"),
+        (1_800_001, "less than or equal to 1800000"),
+    ],
+    ids=["zero", "below_min", "above_max"],
+)
+def test_session_timeout_outside_the_broker_range_is_rejected(value: int, message: str) -> None:
+    # Below the minimum the broker answers INVALID_SESSION_TIMEOUT for ever and the consumer runs
+    # without partitions (phase 7 spike); refused at load instead. Matched on the bound, not the
+    # field name: the poll-interval check's message names the field too.
+    with pytest.raises(ValidationError, match=message):
+        make_settings(consumer_session_timeout_ms=value, consumer_max_poll_interval_ms=1_800_001)
 
 
 # Worst-case database time of one message with these: one transaction is (5 + 5) s + 4 x 10 s =
@@ -249,15 +283,36 @@ def test_long_statement_timeout_needs_a_longer_max_poll_interval_than_the_defaul
         make_settings(**LONG_STATEMENTS)
 
 
-def test_max_poll_interval_below_the_session_timeout_is_rejected() -> None:
+# Database timeouts small enough that the worst-case floor stays below the session timeouts used.
+SMALL_DB_TIMEOUTS = {
+    "db_pool_timeout_s": 1.0,
+    "db_connect_timeout_s": 2,
+    "db_statement_timeout_ms": 1000,
+}
+
+
+@pytest.mark.parametrize("session_ms", [45_000, 120_000], ids=["default", "raised"])
+def test_max_poll_interval_below_the_session_timeout_is_rejected(session_ms: int) -> None:
     # librdkafka refuses it: "max.poll.interval.ms must be >= session.timeout.ms".
-    with pytest.raises(ValidationError, match="at least 45000"):
+    with pytest.raises(
+        ValidationError,
+        match=re.escape(f"at least consumer_session_timeout_ms ({session_ms})"),
+    ):
         make_settings(
-            db_pool_timeout_s=1.0,
-            db_connect_timeout_s=2,
-            db_statement_timeout_ms=1000,
-            consumer_max_poll_interval_ms=44_999,
+            **SMALL_DB_TIMEOUTS,
+            consumer_session_timeout_ms=session_ms,
+            consumer_max_poll_interval_ms=session_ms - 1,
         )
+
+
+def test_max_poll_interval_equal_to_the_session_timeout_makes_a_consumer() -> None:
+    settings = make_settings(
+        **SMALL_DB_TIMEOUTS,
+        consumer_session_timeout_ms=120_000,
+        consumer_max_poll_interval_ms=120_000,
+    )
+
+    Consumer(consumer_config(settings)).close()
 
 
 @pytest.mark.parametrize("close_timeout_s", [1.0, 0.5], ids=["equal", "shorter"])
